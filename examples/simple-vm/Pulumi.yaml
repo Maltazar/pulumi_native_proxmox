@@ -1,0 +1,121 @@
+name: proxmox-simple-vm
+runtime:
+  name: yaml
+  options:
+    toolchain: uv
+    virtualenv: .venv
+
+description: A simple VM deployment using the Pulumi Native Proxmox provider
+
+config:
+  # Provider Configuration
+  proxmox:endpoint:
+    type: string
+    description: The Proxmox API endpoint URL
+    default: https://proxmox.example.com:8006/api2/json
+  
+  proxmox:username:
+    type: string
+    description: Username for Proxmox API (format user@realm, e.g., root@pam)
+    default: root@pam
+  
+  proxmox:password:
+    type: string
+    description: Password for Proxmox API
+    secret: true
+  
+  proxmox:node:
+    type: string
+    description: Default Proxmox node to use
+    default: pve
+  
+  proxmox:insecure:
+    type: boolean
+    description: Skip TLS verification
+    default: true
+  
+  # VM Configuration
+  vm:template_id:
+    type: string
+    description: ID of the template to clone
+    default: "9001"
+  
+  vm:cores:
+    type: number
+    description: Number of CPU cores
+    default: 2
+  
+  vm:memory:
+    type: number
+    description: Memory in MB
+    default: 4096
+  
+  vm:disk_size:
+    type: string
+    description: Disk size (e.g., 15G)
+    default: 15G
+  
+  vm:network_bridge:
+    type: string
+    description: Network bridge to use
+    default: vmbr0
+  
+  vm:disk_storage:
+    type: string
+    description: Storage ID for the disk
+    default: local-lvm
+  
+  vm:vlan_tag:
+    type: string
+    description: VLAN tag for the VM
+    default: "140"
+  
+  # Cloud-init Configuration
+  cloud_init:username:
+    type: string
+    description: Username for cloud-init
+    default: initial
+  
+  cloud_init:ssh_public_key:
+    type: string
+    description: Path to SSH public key for cloud-init
+    default: ~/.ssh/id_rsa.pub
+  
+  cloud_init:ssh_private_key:
+    type: string
+    description: Path to SSH private key for cloud-init
+    secret: true
+    default: ~/.ssh/id_rsa
+
+resources:
+  # Create the provider instance
+  provider:
+    type: proxmox:index:Provider
+    properties:
+      endpoint: ${proxmox:endpoint}
+      username: ${proxmox:username}
+      password: ${proxmox:password}
+      node: ${proxmox:node}
+      insecure: ${proxmox:insecure}
+  
+  # Create a simple VM
+  test-vm:
+    type: proxmox:vm:VM
+    properties:
+      template_id: ${vm:template_id}
+      cores: ${vm:cores}
+      memory: ${vm:memory}
+      disk_size: ${vm:disk_size}
+      disk_storage: ${vm:disk_storage}
+      network_bridge: ${vm:network_bridge}
+      vlan_tag: ${vm:vlan_tag}
+      start_on_create: true
+      wait_for_ssh: true
+      cloud_init_user: ${cloud_init:username}
+      cloud_init_ssh_key: ${cloud_init:ssh_public_key}
+
+outputs:
+  vm_id:
+    value: ${test-vm.id}
+  vm_ip:
+    value: ${test-vm.ip_address} 

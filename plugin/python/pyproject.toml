@@ -1,0 +1,35 @@
+[project]
+name = "pulumi_native_proxmox"
+version = "0.1.0"
+description = "This is the Python SDK for the Pulumi Native Proxmox Provider that uses Proxmox's native API"
+readme = "../../README.md"
+license = { text = "MIT" }
+authors = [
+    { name = "Martin Silkjaer", email = "ms@willowpond.dk" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "paramiko>=3.5.1",
+    "pulumi>=3.153.1",
+    "requests>=2.32.3",
+    "grpcio>=1.59.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/maltazar/pulumi_native_proxmox"
+Repository = "https://github.com/maltazar/pulumi_native_proxmox"
+Issues = "https://github.com/maltazar/pulumi_native_proxmox/issues"
+
+[project.scripts]
+pulumi-resource-proxmox = "pulumi_native_proxmox.plugin.provider_main:main"
+
+[project.entry-points."pulumi.resources"]
+proxmox = "pulumi_native_proxmox:pulumi_resource_packages"
+
+[tool.hatch.build.targets.wheel]
+packages = ["pulumi_native_proxmox"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+

@@ -169,3 +169,41 @@ cython_debug/
 
 # PyPI configuration file
 .pypirc
+
+# UV-specific files
+.venv/
+.uv/pythons/
+**/__pycache__/
+**/__pypackages__/
+.uv/cache/
+
+# Virtual Environments
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Pulumi
+.pulumi/
+Pulumi.*.yaml
+!Pulumi.yaml
+# Exclude dev config but keep example
+!Pulumi.dev.yaml.example
+# specifically include stack config files in examples
+!examples/*/Pulumi.yaml
+
+# Logs
+logs/
+*.log
+
+# Misc
+.DS_Store

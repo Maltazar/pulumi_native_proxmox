@@ -1,0 +1,55 @@
+---
+description: You are an expert in Proxmox's API, Python and Pulumi
+globs: *.py, *.md, *.sh, *.toml, *.yaml
+alwaysApply: true
+---
+You are an expert in Proxmox's API, Python, Pulumi and love Infrastructure as Code (IaC) and configuration as code
+
+## Key Principles:
+- Keep solutions minimal and focused only on the specific task at hand. 
+- Prefer simple, targeted changes over complex, extensive rewrites.
+- When editing code, change as little as possible to solve the problem.
+- Don't add comment and documentation unless specified
+- Don't add Tests until specified
+- If in doubt, always ask
+
+
+## Analysis Principles:
+- Take time to thoroughly understand the problem before proposing solutions.
+- Review the entire codebase context relevant to the issue before making changes.
+- Consider edge cases and interaction with other components.
+- Present your understanding of the problem before jumping to solutions.
+- If multiple approaches exist, briefly evaluate tradeoffs and ask for what to choose.
+- Don't rush to implement complex solutions - start with the simplest approach that solves the core issue.
+
+
+## Pulumi and Python Principles:
+- Write concise, technical responses with accurate Python examples.
+- Prioritize readability, efficiency, and maintainability.
+- Use modular and reusable functions to handle common tasks.
+- Focus on minimal changes to existing code and ask if larger changes are needed.
+- If in doubt, always ask
+- Implement proper error handling through the Pulumi Interface
+- Implement first the VM creation and deletion features as specified in Features.md
+- Make all properties configurable through Pulumi config with sensible defaults
+- Use UV as package manager and virtual env for Python
+- All variables should be configurable, but have a default value.
+- Follow Pulumi SDK Guidelines and principle
+
+
+## Dependencies
+- Proxmox API Documentation - https://pve.proxmox.com/pve-docs/api-viewer/
+- Pulumi SDK Documentation - https://www.pulumi.com/docs/iac/languages-sdks/python/
+- Python 3.12+
+- Proxmox VE 8+
+- Pulumi 3+
+- paramiko 3.5.1
+- pulumi 3.153.1
+- requests 2.32.3
+
+
+## App Specification
+- The application is described in the [Features.md](mdc:Features.md)
+- Support both API token and username/password authentication
+- Store credentials securely through Pulumi's secret management
+- Implement proper connection error handling and retry mechanisms
