@@ -1,10 +1,10 @@
-name: pulumi-native-proxmox
+name: pulumi-native-proxmox-dynamic
 runtime:
   name: python
   options:
     virtualenv: ../.venv
 
-description: A native Pulumi provider for Proxmox VE that allows you to create and manage VMs
+description: Dynamic provider for Proxmox VE that allows creating and managing VMs.
 
 # Configuration schema
 config:

@@ -10,50 +10,56 @@ import pulumi_native_proxmox as proxmox
 
 # Get configuration values
 config = pulumi.Config()
+cloud_init_config = pulumi.Config("cloud_init")
+vm_user_config = pulumi.Config("vm_user")
+vm_group_config = pulumi.Config("vm_group")
+vm_setup_config = pulumi.Config("vm_setup")
 
-# Create the provider instance
-provider = proxmox.Provider("proxmox",
-    endpoint=config.require("proxmox:endpoint"),
-    username=config.get("proxmox:username"),
-    password=config.get_secret("proxmox:password"),
-    token_id=config.get("proxmox:token_id"),
-    token_secret=config.get_secret("proxmox:token_secret"),
-    node=config.get("proxmox:node"),
-    insecure=config.get_bool("proxmox:insecure") or False,
-    timeout=config.get_int("proxmox:timeout") or 30,
-    debug=config.get_bool("proxmox:debug") or False
-)
+# Create the provider instance with a props dictionary
+provider_props = {
+    'endpoint': config.require("endpoint"),
+    'username': config.get("username"),
+    'password': config.get_secret("password"),
+    'token_id': config.get("token_id"),
+    'token_secret': config.get_secret("token_secret"),
+    'node': config.get("node"),
+    'insecure': config.get_bool("insecure") or False,
+    'timeout': config.get_int("timeout") or 30,
+    'debug': config.get_bool("debug") or False
+}
+
+provider = proxmox.Provider("proxmox", provider_props)
 
 # Create a single VM
 vm = proxmox.VM("example-vm",
     # Required fields
-    template_id=config.require("vm:template_id"),
-    vmid=config.get_int("vm:vmid"),
+    template_id=config.require("template_id"),
+    vmid=config.get_int("vmid"),
     
     # Compute
-    cores=config.get_int("vm:cores") or 1,
-    sockets=config.get_int("vm:sockets") or 1,
-    memory=config.get_int("vm:memory") or 512,
+    cores=config.get_int("cores") or 1,
+    sockets=config.get_int("sockets") or 1,
+    memory=config.get_int("memory") or 512,
     
     # Storage
-    disk_size=config.get("vm:disk_size"),
-    disk_storage=config.get("vm:disk_storage"),
+    disk_size=config.get("disk_size"),
+    disk_storage=config.get("disk_storage"),
     
     # Network
-    network_bridge=config.get("vm:network_bridge") or "vmbr0",
-    vlan_tag=config.get_int("vm:vlan_tag"),
+    network_bridge=config.get("network_bridge") or "vmbr0",
+    vlan_tag=config.get_int("vlan_tag"),
     
     # Operation
-    start_on_create=config.get_bool("vm:start_on_create") or True,
-    wait_for_ssh=config.get_bool("vm:wait_for_ssh") or False,
+    start_on_create=config.get_bool("start_on_create") or True,
+    wait_for_ssh=config.get_bool("wait_for_ssh") or False,
     
     # Cloud-init
-    cloud_init_user=config.get("cloud_init:username"),
-    cloud_init_password=config.get_secret("cloud_init:password"),
-    cloud_init_ssh_key=config.get("cloud_init:ssh_public_key"),
+    cloud_init_user=cloud_init_config.get("username"),
+    cloud_init_password=cloud_init_config.get_secret("password"),
+    cloud_init_ssh_key=cloud_init_config.get("ssh_public_key"),
     
     # Post-provisioning
-    commands=config.get_object("vm_setup:commands") or [],
+    commands=vm_setup_config.get_object("commands") or [],
     
     # Reference to the provider we created
     opts=pulumi.ResourceOptions(provider=provider)
@@ -62,25 +68,25 @@ vm = proxmox.VM("example-vm",
 # Create a VM group
 vm_group = proxmox.VMGroup("example-vm-group",
     # Group configuration
-    prefix=config.get("vm_group:prefix") or "vm",
-    count=config.get_int("vm_group:count") or 1,
-    vm_start_id=config.get_int("vm_group:vm_start_id") or 100,
-    ip_range=config.get("vm_group:ip_range") or "dhcp",
-    gateway=config.get("vm_group:gateway"),
+    prefix=vm_group_config.get("prefix") or "vm",
+    count=vm_group_config.get_int("count") or 1,
+    vm_start_id=vm_group_config.get_int("vm_start_id") or 100,
+    ip_range=vm_group_config.get("ip_range") or "dhcp",
+    gateway=vm_group_config.get("gateway"),
     
     # VM configuration (passed to each VM)
-    template_id=config.require("vm:template_id"),
-    cores=config.get_int("vm:cores") or 1,
-    memory=config.get_int("vm:memory") or 512,
-    disk_size=config.get("vm:disk_size"),
-    disk_storage=config.get("vm:disk_storage"),
-    network_bridge=config.get("vm:network_bridge") or "vmbr0",
-    vlan_tag=config.get_int("vm:vlan_tag"),
+    template_id=config.require("template_id"),
+    cores=config.get_int("cores") or 1,
+    memory=config.get_int("memory") or 512,
+    disk_size=config.get("disk_size"),
+    disk_storage=config.get("disk_storage"),
+    network_bridge=config.get("network_bridge") or "vmbr0",
+    vlan_tag=config.get_int("vlan_tag"),
     
     # Cloud-init
-    cloud_init_user=config.get("cloud_init:username"),
-    cloud_init_password=config.get_secret("cloud_init:password"),
-    cloud_init_ssh_key=config.get("cloud_init:ssh_public_key"),
+    cloud_init_user=cloud_init_config.get("username"),
+    cloud_init_password=cloud_init_config.get_secret("password"),
+    cloud_init_ssh_key=cloud_init_config.get("ssh_public_key"),
     
     # Reference to the provider we created
     opts=pulumi.ResourceOptions(provider=provider)

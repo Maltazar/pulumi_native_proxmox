@@ -75,7 +75,7 @@ config:
   # New user after VM is created.
   vm_user:create_admin_user: "true"
   vm_user:ssh_public_key: /home/ms/.ssh/id_rsa_k3s.pub
-  vm_user:ssh_private_key: /home/ms/.ssh/id_rsa_k3s.pub
+  vm_user:ssh_private_key: /home/ms/.ssh/id_rsa_k3s
     # If not path
     secure: ****
   vm_user:username: k3s

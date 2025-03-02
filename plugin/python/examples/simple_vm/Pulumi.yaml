@@ -1,0 +1,6 @@
+name: proxmox-dynamic-provider-example
+runtime:
+  name: python
+  options:
+    virtualenv: ../../.venv
+description: A simple example of using the Proxmox dynamic provider 

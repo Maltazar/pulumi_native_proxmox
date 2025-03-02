@@ -1,0 +1,7 @@
+name: proxmox-cluster-example
+runtime:
+  name: python
+  options:
+    toolchain: uv
+    virtualenv: ../../.venv
+description: An example of creating a Kubernetes cluster using the Proxmox dynamic provider 

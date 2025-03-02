@@ -27,9 +27,13 @@ pulumi-resource-proxmox = "pulumi_native_proxmox.plugin.provider_main:main"
 proxmox = "pulumi_native_proxmox:pulumi_resource_packages"
 
 [tool.hatch.build.targets.wheel]
-packages = ["pulumi_native_proxmox"]
+packages = ["pulumi_native_proxmox", "pulumi_native_proxmox_dynamic"]
 
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+# Additional project for the dynamic provider
+[project.optional-dependencies]
+dynamic = []
 
