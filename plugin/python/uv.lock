@@ -284,6 +284,7 @@ name = "pulumi-native-proxmox"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
+    { name = "grpcio" },
     { name = "paramiko" },
     { name = "pulumi" },
     { name = "requests" },
@@ -291,6 +292,7 @@ dependencies = [
 
 [package.metadata]
 requires-dist = [
+    { name = "grpcio", specifier = ">=1.59.0" },
     { name = "paramiko", specifier = ">=3.5.1" },
     { name = "pulumi", specifier = ">=3.153.1" },
     { name = "requests", specifier = ">=2.32.3" },
