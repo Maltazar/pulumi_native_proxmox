@@ -164,6 +164,7 @@ extract_config_keys() {
     local in_config=false
     local config_keys=()
     local is_secret=()
+    local is_boolean=()
     
     # Uncomment for debugging
     # echo "DEBUG: Starting to parse Pulumi.yaml for configuration keys..."
@@ -209,6 +210,12 @@ extract_config_keys() {
                 
                 # Check if this key has "secret: true" property in the next lines
                 local is_secret_value="false"
+                local is_boolean_value="false"
+                
+                # Check if this is a boolean value
+                if [[ "$value" =~ boolean ]]; then
+                    is_boolean_value="true"
+                fi
                 
                 # Automatically mark certain keys as secrets based on name
                 if [[ "$key" =~ password|token|key|secret ]]; then
@@ -235,9 +242,10 @@ extract_config_keys() {
                 # Add the key to our arrays
                 config_keys+=("$key")
                 is_secret+=("$is_secret_value")
+                is_boolean+=("$is_boolean_value")
                 
                 # Uncomment for debugging
-                # echo "DEBUG: Added config key: $key (Secret: $is_secret_value)"
+                # echo "DEBUG: Added config key: $key (Secret: $is_secret_value, Boolean: $is_boolean_value)"
             fi
         fi
     done < "Pulumi.yaml"
@@ -248,12 +256,14 @@ extract_config_keys() {
         # echo "DEBUG: No configuration keys found in Pulumi.yaml"
         echo ""
         echo ""
+        echo ""
         return
     fi
     
-    # Output the extracted keys and secret status
+    # Output the extracted keys and their properties
     echo "${config_keys[@]}"
     echo "${is_secret[@]}"
+    echo "${is_boolean[@]}"
 }
 
 # Configure the stack with dynamically extracted configuration keys
@@ -263,7 +273,7 @@ configure_stack() {
     
     print_warning "Reading configuration from Pulumi.yaml..."
     
-    # Extract configuration keys (capture both outputs in one call)
+    # Extract configuration keys (capture all outputs in one call)
     local config_output
     config_output=$(extract_config_keys)
     
@@ -279,13 +289,15 @@ configure_stack() {
         return
     fi
     
-    # Parse the output to get the keys and secrets status
+    # Parse the output to get the keys and properties
     local config_keys_str=$(echo "$config_output" | head -1)
-    local is_secret_str=$(echo "$config_output" | tail -1)
+    local is_secret_str=$(echo "$config_output" | head -2 | tail -1)
+    local is_boolean_str=$(echo "$config_output" | tail -1)
     
     # Convert space-separated strings to arrays
     IFS=' ' read -ra config_keys <<< "$config_keys_str"
     IFS=' ' read -ra is_secret <<< "$is_secret_str"
+    IFS=' ' read -ra is_boolean <<< "$is_boolean_str"
     
     # Check if we got any configuration keys
     if [ ${#config_keys[@]} -eq 0 ]; then
@@ -318,11 +330,18 @@ configure_stack() {
         for i in "${!config_keys[@]}"; do
             local key="${config_keys[$i]}"
             local secret="${is_secret[$i]}"
-            local secure_indicator=""
+            local boolean="${is_boolean[$i]}"
+            local indicators=""
+            
             if [ "$secret" = "true" ]; then
-                secure_indicator=" ${RED}[SECRET]${NC}"
+                indicators+=" ${RED}[SECRET]${NC}"
             fi
-            echo -e "  - ${YELLOW}${key}${NC}${secure_indicator}"
+            
+            if [ "$boolean" = "true" ]; then
+                indicators+=" ${BLUE}[BOOLEAN]${NC}"
+            fi
+            
+            echo -e "  - ${YELLOW}${key}${NC}${indicators}"
         done
         echo
     fi
@@ -331,6 +350,7 @@ configure_stack() {
     for i in "${!config_keys[@]}"; do
         local key="${config_keys[$i]}"
         local secret="${is_secret[$i]}"
+        local boolean="${is_boolean[$i]}"
         
         # Force secrets for keys containing sensitive terms
         if [[ "$key" =~ password|token|key|secret ]]; then
@@ -341,8 +361,18 @@ configure_stack() {
         
         # Format the key name nicely for display
         local key_display="${key}"
+        local key_type=""
+        
         if [ "$secret" = "true" ]; then
-            key_display="${key} ${RED}[SECRET]${NC}"
+            key_type+="${RED}[SECRET]${NC}"
+        fi
+        
+        if [ "$boolean" = "true" ]; then
+            key_type+=" ${BLUE}[BOOLEAN]${NC}"
+        fi
+        
+        if [ -n "$key_type" ]; then
+            key_display="${key} ${key_type}"
         fi
         
         # Display the key name
@@ -350,14 +380,28 @@ configure_stack() {
         
         # Show current value if it exists
         local prompt_text=""
+        local boolean_indicator=""
+        
+        if [ "$boolean" = "true" ]; then
+            boolean_indicator=" (y/n)"
+        fi
+        
         if [ "$current_value" = "__ALREADY_SET_SECRET__" ]; then
             echo -e "${GREEN}Current value is set (secret)${NC}"
-            prompt_text="Enter new value for ${key} (leave empty to keep current): "
+            prompt_text="Enter new value for ${key}${boolean_indicator} (leave empty to keep current): "
         elif [ -n "$current_value" ]; then
-            echo -e "Current value: ${GREEN}$current_value${NC}"
-            prompt_text="Enter new value for ${key} (leave empty to keep current): "
+            local display_value="$current_value"
+            if [ "$boolean" = "true" ]; then
+                if [ "$current_value" = "true" ]; then
+                    display_value="yes"
+                elif [ "$current_value" = "false" ]; then
+                    display_value="no"
+                fi
+            fi
+            echo -e "Current value: ${GREEN}$display_value${NC}"
+            prompt_text="Enter new value for ${key}${boolean_indicator} (leave empty to keep current): "
         else
-            prompt_text="Enter value for ${key}: "
+            prompt_text="Enter value for ${key}${boolean_indicator}: "
         fi
         
         # Prompt for value
@@ -377,6 +421,18 @@ configure_stack() {
                 continue
             else
                 print_warning "Empty value provided, skipping..."
+                continue
+            fi
+        fi
+        
+        # Process the input for boolean values
+        if [ "$boolean" = "true" ]; then
+            if [[ "$value" =~ ^[Yy]$ ]]; then
+                value="true"
+            elif [[ "$value" =~ ^[Nn]$ ]]; then
+                value="false"
+            else
+                print_warning "Invalid boolean value. Please enter 'y' or 'n'. Skipping..."
                 continue
             fi
         fi

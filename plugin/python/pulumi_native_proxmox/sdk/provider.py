@@ -4,7 +4,7 @@ This module defines the Provider class for the Pulumi Native Proxmox provider.
 """
 
 import pulumi
-from pulumi.provider import ProviderResource
+from pulumi import ProviderResource
 
 class Provider(ProviderResource):
     """The provider type for the Proxmox package."""
