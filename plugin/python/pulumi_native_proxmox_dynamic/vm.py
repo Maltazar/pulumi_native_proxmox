@@ -11,22 +11,25 @@ import pulumi.dynamic
 import paramiko
 import os
 import base64
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Union, Tuple, Callable
+import logging
+import urllib.parse
 
 from .proxmox_client import ProxmoxClient
+from .provider import ProxmoxProvider
 
 
 class VMProvider(pulumi.dynamic.ResourceProvider):
     """Dynamic resource provider for Proxmox VMs."""
     
     def create(self, props: Dict[str, Any]) -> pulumi.dynamic.CreateResult:
-        """Create a new VM in Proxmox.
+        """Create a new VM in Proxmox by cloning a template.
         
         Args:
             props: Resource properties
             
         Returns:
-            CreateResult with VM ID and other properties
+            CreateResult with VM properties
         """
         client = self._get_client(props)
         
@@ -45,6 +48,9 @@ class VMProvider(pulumi.dynamic.ResourceProvider):
             # Get the next available VM ID
             next_id = self._get_next_vmid(client)
             vmid = next_id
+        else:
+            # Ensure vmid is an integer
+            vmid = int(vmid)
         
         # Clone the template
         self._clone_template(client, node, template_id, vmid, props)
@@ -113,8 +119,8 @@ class VMProvider(pulumi.dynamic.ResourceProvider):
             ReadResult with VM properties
         """
         # Parse VM ID from resource ID
-        node, vmid = id.split('/')
-        vmid = int(vmid)
+        node, vmid_str = id.split('/')
+        vmid = int(vmid_str)  # Explicitly convert to integer
         
         client = self._get_client(props)
         
@@ -131,10 +137,10 @@ class VMProvider(pulumi.dynamic.ResourceProvider):
         outputs.update({
             'vmid': vmid,
             'node': node,
-            'status': vm_status.get('status', 'unknown'),
-            'name': vm_config.get('name', ''),
-            'cores': vm_config.get('cores', 1),
-            'memory': vm_config.get('memory', 512),
+            'status': vm_status.get('data', {}).get('status', 'unknown'),
+            'name': vm_config.get('data', {}).get('name', ''),
+            'cores': vm_config.get('data', {}).get('cores', 1),
+            'memory': vm_config.get('data', {}).get('memory', 512),
         })
         
         # Try to get IP address if agent is enabled and VM is running
@@ -169,8 +175,8 @@ class VMProvider(pulumi.dynamic.ResourceProvider):
             UpdateResult with updated VM properties
         """
         # Parse VM ID from resource ID
-        node, vmid = id.split('/')
-        vmid = int(vmid)
+        node, vmid_str = id.split('/')
+        vmid = int(vmid_str)  # Explicitly convert to integer
         
         client = self._get_client(news)
         
@@ -187,7 +193,7 @@ class VMProvider(pulumi.dynamic.ResourceProvider):
         
         # Get VM status
         vm_status = client.request('GET', f'/nodes/{node}/qemu/{vmid}/status/current')
-        was_running = vm_status.get('status') == 'running'
+        was_running = vm_status.get('data', {}).get('status') == 'running'
         
         # Stop VM if needed
         if requires_stop and was_running:
@@ -247,8 +253,8 @@ class VMProvider(pulumi.dynamic.ResourceProvider):
             props: Resource properties
         """
         # Parse VM ID from resource ID
-        node, vmid = id.split('/')
-        vmid = int(vmid)
+        node, vmid_str = id.split('/')
+        vmid = int(vmid_str)  # Explicitly convert to integer
         
         client = self._get_client(props)
         
@@ -256,7 +262,7 @@ class VMProvider(pulumi.dynamic.ResourceProvider):
         vm_status = client.request('GET', f'/nodes/{node}/qemu/{vmid}/status/current')
         
         # Stop VM if running
-        if vm_status.get('status') == 'running':
+        if vm_status.get('data', {}).get('status') == 'running':
             client.request('POST', f'/nodes/{node}/qemu/{vmid}/status/stop')
             
             # Wait for VM to stop
@@ -320,16 +326,43 @@ class VMProvider(pulumi.dynamic.ResourceProvider):
             clone_params['storage'] = props.get('disk_storage')
         
         # Clone the template
-        client.request(
+        response = client.request(
             'POST',
             f'/nodes/{node}/qemu/{template_id}/clone',
             data=clone_params
         )
         
-        # Wait for clone to complete
-        self._wait_for_task_completion(client, node)
+        # Debug log the response
+        client.logger.debug(f"Clone response: {response}")
+        
+        # Wait for clone to complete - get the task ID from the response
+        task_id = None
+        
+        # Handle different response formats
+        if isinstance(response, dict):
+            # If response is a dictionary
+            if 'data' in response:
+                task_id = response['data']
+                client.logger.debug(f"Found task ID in response['data']: {task_id}")
+            else:
+                for key, value in response.items():
+                    client.logger.debug(f"Key: {key}, Value: {value}")
+                    if key in ['upid', 'task_id']:
+                        task_id = value
+                        client.logger.debug(f"Found task ID in key '{key}': {task_id}")
+        elif isinstance(response, str):
+            # If response is just a string, assume it's the task ID
+            task_id = response
+            client.logger.debug(f"Response is string, using as task ID: {task_id}")
+        
+        if task_id:
+            client.logger.debug(f"Waiting for specific task: {task_id}")
+            self._wait_for_specific_task(client, node, task_id)
+        else:
+            client.logger.debug("No task ID found, falling back to waiting for all tasks")
+            self._wait_for_task_completion(client, node)
     
-    def _configure_vm(self, client: ProxmoxClient, node: str, vmid: int, 
+    def _configure_vm(self, client: ProxmoxClient, node: str, vmid: Union[int, float, str], 
                      props: Dict[str, Any]) -> None:
         """Configure a VM after cloning.
         
@@ -339,21 +372,23 @@ class VMProvider(pulumi.dynamic.ResourceProvider):
             vmid: VM ID
             props: Resource properties
         """
+        vmid = int(vmid)  # Ensure vmid is an integer
+        
         # Build configuration object
         config = {}
         
         # Compute resources
         if props.get('cores'):
-            config['cores'] = props.get('cores')
+            config['cores'] = int(props.get('cores'))
         if props.get('sockets'):
-            config['sockets'] = props.get('sockets')
+            config['sockets'] = int(props.get('sockets'))
         if props.get('memory'):
-            config['memory'] = props.get('memory')
+            config['memory'] = int(props.get('memory'))
         
         # Disk configuration
         if props.get('disk_size'):
             # Resize disk
-            client.request(
+            response = client.request(
                 'PUT',
                 f'/nodes/{node}/qemu/{vmid}/resize',
                 params={
@@ -361,12 +396,20 @@ class VMProvider(pulumi.dynamic.ResourceProvider):
                     'size': props.get('disk_size'),
                 }
             )
+            
+            # Wait for resize to complete
+            if 'data' in response and isinstance(response['data'], str):
+                task_id = response['data']
+                self._wait_for_specific_task(client, node, task_id)
+            else:
+                # Fallback to waiting for all tasks
+                self._wait_for_task_completion(client, node)
         
         # Network configuration
         if props.get('network_bridge') or props.get('vlan_tag'):
             net_config = f'model=virtio,bridge={props.get("network_bridge", "vmbr0")}'
             if props.get('vlan_tag'):
-                net_config += f',tag={props.get("vlan_tag")}'
+                net_config += f',tag={int(props.get("vlan_tag"))}'
             config['net0'] = net_config
         
         # Cloud-init configuration
@@ -382,7 +425,11 @@ class VMProvider(pulumi.dynamic.ResourceProvider):
             if ssh_key.startswith('/') and os.path.exists(ssh_key):
                 with open(ssh_key, 'r') as f:
                     ssh_key = f.read().strip()
-            config['sshkeys'] = ssh_key.replace('\n', '\\n')
+            
+            # URL encode the SSH key - properly format without newlines
+            # Proxmox expects a properly formatted SSH key
+            ssh_key = ssh_key.replace('\n', '')
+            config['sshkeys'] = urllib.parse.quote(ssh_key)
         
         # Enable Proxmox agent if requested in VM setup features
         vm_setup_features = props.get('vm_setup_features', [])
@@ -394,11 +441,12 @@ class VMProvider(pulumi.dynamic.ResourceProvider):
         
         # Apply configuration if any
         if config:
-            client.request(
+            response = client.request(
                 'POST',
                 f'/nodes/{node}/qemu/{vmid}/config',
                 data=config
             )
+            # No need to wait for completion as config changes are usually immediate
     
     def _start_vm(self, client: ProxmoxClient, node: str, vmid: int) -> None:
         """Start a VM.
@@ -408,114 +456,92 @@ class VMProvider(pulumi.dynamic.ResourceProvider):
             node: Proxmox node
             vmid: VM ID
         """
-        client.request('POST', f'/nodes/{node}/qemu/{vmid}/status/start')
+        response = client.request('POST', f'/nodes/{node}/qemu/{vmid}/status/start')
+        
+        # Wait for the start task to complete
+        if 'data' in response and isinstance(response['data'], str):
+            task_id = response['data']
+            self._wait_for_specific_task(client, node, task_id)
+        
+        # Then wait for VM to reach running state
         self._wait_for_vm_state(client, node, vmid, 'running')
     
-    def _wait_for_vm_state(self, client: ProxmoxClient, node: str, vmid: int, 
+    def _wait_for_vm_state(self, client: ProxmoxClient, node: str, vmid: Union[int, float, str], 
                           state: str, timeout: int = 300) -> None:
-        """Wait for VM to reach a specific state.
-        
-        Args:
-            client: ProxmoxClient instance
-            node: Proxmox node
-            vmid: VM ID
-            state: Target state
-            timeout: Timeout in seconds
-        """
+        """Wait for VM to reach the specified state."""
+        vmid = int(vmid)  # Ensure vmid is an integer
         start_time = time.time()
-        while True:
-            vm_status = client.request('GET', f'/nodes/{node}/qemu/{vmid}/status/current')
-            if vm_status.get('status') == state:
+        while time.time() - start_time < timeout:
+            current_state = self._get_vm_status(client, node, vmid)
+            logging.info(f"VM {vmid} current state: {current_state}")
+            if current_state == state:
                 return
-            
-            if time.time() - start_time > timeout:
-                raise Exception(f"Timeout waiting for VM {vmid} to reach state {state}")
-            
             time.sleep(5)
+        raise Exception(f"Timeout waiting for VM {vmid} to reach state {state}")
     
-    def _wait_for_ip_address(self, client: ProxmoxClient, node: str, vmid: int, 
-                           timeout: int = 300) -> Optional[str]:
-        """Wait for VM to get an IP address.
-        
-        Args:
-            client: ProxmoxClient instance
-            node: Proxmox node
-            vmid: VM ID
-            timeout: Timeout in seconds
-            
-        Returns:
-            IP address if found, None otherwise
-        """
+    def _get_vm_status(self, client: ProxmoxClient, node: str, vmid: Union[int, float, str]) -> str:
+        """Get the current status of the VM."""
+        vmid = int(vmid)  # Ensure vmid is an integer
+        response = client.request(
+            "GET", 
+            f"/nodes/{node}/qemu/{vmid}/status/current"
+        )
+        return response.get('data', {}).get('status', '')
+    
+    def _wait_for_ip_address(self, client: ProxmoxClient, node: str, vmid: Union[int, float, str], 
+                            timeout: int = 300) -> Optional[str]:
+        """Wait for VM to get an IP address."""
+        vmid = int(vmid)  # Ensure vmid is an integer
         start_time = time.time()
-        
-        # First check if VM has agent enabled
-        config = client.request('GET', f'/nodes/{node}/qemu/{vmid}/config')
-        if config.get('agent', 0) == 1:
-            # Try to get IP via agent
-            while True:
-                try:
-                    agent_info = client.request('GET', f'/nodes/{node}/qemu/{vmid}/agent/network-get-interfaces')
-                    # Extract IP addresses
-                    for iface in agent_info.get('result', []):
-                        if 'ip-addresses' in iface:
-                            for addr in iface['ip-addresses']:
-                                if addr.get('ip-address') and addr.get('ip-address-type') == 'ipv4':
-                                    return addr.get('ip-address')
-                except Exception:
-                    # Agent might not be available yet
-                    pass
+        while time.time() - start_time < timeout:
+            # Check if agent is working
+            try:
+                response = client.request(
+                    "GET", 
+                    f"/nodes/{node}/qemu/{vmid}/agent/network-get-interfaces"
+                )
                 
-                if time.time() - start_time > timeout:
-                    break
+                interfaces = response.get('data', [])
+                for interface in interfaces:
+                    if interface.get('name') != 'lo':
+                        for ip_info in interface.get('ip-addresses', []):
+                            if ip_info.get('ip-address-type') == 'ipv4':
+                                ip = ip_info.get('ip-address')
+                                if ip and not ip.startswith('127.'):
+                                    logging.info(f"Found IP address: {ip}")
+                                    return ip
+            except Exception as e:
+                logging.info(f"Error getting agent info: {e}")
                 
-                time.sleep(5)
-        
-        # Fallback to using DHCP leases if agent isn't available
-        # This requires the VM to be using a bridge on the Proxmox host
-        vm_name = config.get('name')
-        network_bridge = None
-        
-        # Find the bridge from the VM config
-        for key, value in config.items():
-            if key.startswith('net') and 'bridge=' in value:
-                parts = value.split(',')
-                for part in parts:
-                    if part.startswith('bridge='):
-                        network_bridge = part.split('=')[1]
-                        break
-                if network_bridge:
-                    break
-        
-        if network_bridge:
-            while True:
-                # Try to get DHCP leases
-                try:
-                    leases = client.request('GET', f'/nodes/{node}/network/{network_bridge}/dhcp')
-                    for lease in leases:
-                        if lease.get('hostname') == vm_name:
-                            return lease.get('ip')
-                except Exception:
-                    # DHCP leases might not be available
-                    pass
+            # Fallback - try to get IP from Proxmox
+            try:
+                response = client.request(
+                    "GET", 
+                    f"/nodes/{node}/qemu/{vmid}/config"
+                )
+                ipconfig = []
+                for key, value in response.get('data', {}).items():
+                    if key.startswith('ipconfig'):
+                        ipconfig.append(value)
+                        
+                for config in ipconfig:
+                    if config and 'ip=' in config:
+                        ip = config.split('ip=')[1].split('/')[0]
+                        if ip and not ip.startswith('127.'):
+                            logging.info(f"Found IP address from config: {ip}")
+                            return ip
+            except Exception as e:
+                logging.info(f"Error getting config info: {e}")
                 
-                if time.time() - start_time > timeout:
-                    break
-                
-                time.sleep(5)
+            time.sleep(5)
         
+        logging.warning(f"Timeout waiting for VM {vmid} to get an IP address")
         return None
     
-    def _setup_vm(self, client: ProxmoxClient, node: str, vmid: int, 
-                 ip_address: Optional[str], props: Dict[str, Any]) -> None:
-        """Set up a VM after it has been created and started.
-        
-        Args:
-            client: ProxmoxClient instance
-            node: Proxmox node
-            vmid: VM ID
-            ip_address: VM IP address
-            props: Resource properties
-        """
+    def _setup_vm(self, client: ProxmoxClient, node: str, vmid: Union[int, float, str], 
+                ip_address: Optional[str], props: Dict[str, Any]) -> None:
+        """Setup VM after it has started."""
+        vmid = int(vmid)  # Ensure vmid is an integer
         if not ip_address:
             raise Exception("Cannot set up VM without an IP address")
         
@@ -702,6 +728,65 @@ class VMProvider(pulumi.dynamic.ResourceProvider):
                 
                 time.sleep(5)
     
+    def _wait_for_specific_task(self, client: ProxmoxClient, node: str, task_id: str, 
+                               timeout: int = 300) -> None:
+        """Wait for a specific task to complete.
+        
+        Args:
+            client: ProxmoxClient instance
+            node: Proxmox node
+            task_id: Task ID to wait for
+            timeout: Timeout in seconds
+        """
+        start_time = time.time()
+        
+        while True:
+            # Get task status
+            try:
+                task_status = client.request('GET', f'/nodes/{node}/tasks/{task_id}/status')
+                
+                # Check if task is done - handle different response formats
+                if isinstance(task_status, dict) and 'data' in task_status:
+                    status_data = task_status['data']
+                    if status_data.get('status') == 'stopped':
+                        # Check for errors
+                        if status_data.get('exitstatus') != 'OK':
+                            raise Exception(f"Task {task_id} failed with status: {status_data.get('exitstatus')}")
+                        return
+                elif isinstance(task_status, dict):
+                    # Handle case where data might be directly in response
+                    if task_status.get('status') == 'stopped':
+                        if task_status.get('exitstatus') != 'OK':
+                            raise Exception(f"Task {task_id} failed with status: {task_status.get('exitstatus')}")
+                        return
+                
+            except Exception as e:
+                # If we can't get the task status, check if it's because the task is already gone
+                # which would indicate completion
+                try:
+                    # Get all tasks
+                    all_tasks_response = client.request('GET', f'/nodes/{node}/tasks')
+                    
+                    # Handle different response formats
+                    all_tasks = all_tasks_response
+                    if isinstance(all_tasks_response, dict) and 'data' in all_tasks_response:
+                        all_tasks = all_tasks_response['data']
+                    
+                    # Check if the task is in the list
+                    if not any(t.get('upid') == task_id for t in all_tasks):
+                        # Task is no longer in the list, assume it completed
+                        return
+                except Exception as inner_e:
+                    # If we can't check the task list either, log it and continue
+                    pass
+            
+            # Check timeout
+            if time.time() - start_time > timeout:
+                raise Exception(f"Timeout waiting for task {task_id} to complete on node {node}")
+            
+            # Wait and check again
+            time.sleep(2)
+
     def _wait_for_task_completion(self, client: ProxmoxClient, node: str, 
                                  timeout: int = 300) -> None:
         """Wait for all tasks on a node to complete.
@@ -711,13 +796,16 @@ class VMProvider(pulumi.dynamic.ResourceProvider):
             node: Proxmox node
             timeout: Timeout in seconds
         """
-        # In a real implementation, we would track the specific task ID
-        # This is a simplified version
         start_time = time.time()
         
         while True:
             # List running tasks
-            tasks = client.request('GET', f'/nodes/{node}/tasks')
+            task_response = client.request('GET', f'/nodes/{node}/tasks')
+            
+            # Handle case where response is already a list (no 'data' key)
+            tasks = task_response
+            if isinstance(task_response, dict) and 'data' in task_response:
+                tasks = task_response['data']
             
             # Filter for running tasks
             running_tasks = [t for t in tasks if t.get('status') == 'running']
@@ -731,7 +819,7 @@ class VMProvider(pulumi.dynamic.ResourceProvider):
                 raise Exception(f"Timeout waiting for tasks to complete on node {node}")
             
             # Wait and check again
-            time.sleep(5)
+            time.sleep(2)
 
 
 class VM(pulumi.dynamic.Resource):
@@ -739,8 +827,9 @@ class VM(pulumi.dynamic.Resource):
     
     def __init__(self,
                  name: str,
-                 template_id: str,
+                 template_id: Optional[str] = None,
                  args: Optional[Dict[str, Any]] = None,
+                 provider: Optional["ProxmoxProvider"] = None,
                  opts: Optional[pulumi.ResourceOptions] = None):
         """Create a new VM resource.
         
@@ -748,16 +837,27 @@ class VM(pulumi.dynamic.Resource):
             name: The unique name for the VM resource.
             template_id: The template ID to clone from.
             args: Additional arguments to configure the VM.
+            provider: The ProxmoxProvider to use for API access.
             opts: Resource options.
         """
         if args is None:
             args = {}
             
         # Ensure template_id is set
-        args['template_id'] = template_id
+        if template_id is not None:
+            args['template_id'] = template_id
+        elif 'template_id' not in args:
+            raise ValueError("template_id is required")
         
         # Set resource name
         args['name'] = name
+        
+        # Add provider configuration to args if available
+        if provider:
+            provider_config = provider.get_config()
+            for key, value in provider_config.items():
+                if value is not None and key not in args:
+                    args[key] = value
         
         # Initialize the dynamic resource
         super().__init__(

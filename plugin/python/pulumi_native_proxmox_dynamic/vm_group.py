@@ -10,6 +10,7 @@ import pulumi
 from typing import Any, Dict, List, Optional, Union
 
 from .vm import VM
+from .provider import ProxmoxProvider
 
 
 class VMGroup(pulumi.ComponentResource):
@@ -20,10 +21,11 @@ class VMGroup(pulumi.ComponentResource):
                  template_id: str,
                  prefix: Optional[str] = None,
                  count: Optional[int] = None,
-                 vm_start_id: Optional[int] = None,
+                 vm_start_id: Optional[Union[int, float, str]] = None,
                  ip_range: Optional[str] = None,
                  gateway: Optional[str] = None,
                  args: Optional[Dict[str, Any]] = None,
+                 provider: Optional["ProxmoxProvider"] = None,
                  opts: Optional[pulumi.ResourceOptions] = None):
         """Create a new VM group.
         
@@ -36,6 +38,7 @@ class VMGroup(pulumi.ComponentResource):
             ip_range: The IP range for the VMs (e.g., '10.1.20.80-10.1.20.85').
             gateway: The default gateway for the VMs.
             args: Additional arguments to configure the VMs.
+            provider: The ProxmoxProvider to use for API access.
             opts: Resource options.
         """
         # Initialize the component resource
@@ -69,6 +72,8 @@ class VMGroup(pulumi.ComponentResource):
             
             # Set VM ID if a starting ID is provided
             if vm_start_id is not None:
+                # Ensure vm_start_id is an integer
+                vm_start_id = int(vm_start_id)
                 vm_props['vmid'] = vm_start_id + i
             
             # Set IP address if available
@@ -88,6 +93,7 @@ class VMGroup(pulumi.ComponentResource):
                 f"{name}-{vm_name}",
                 template_id=template_id,
                 args=vm_props,
+                provider=provider,
                 opts=pulumi.ResourceOptions(parent=self)
             )
             self.vms.append(vm)

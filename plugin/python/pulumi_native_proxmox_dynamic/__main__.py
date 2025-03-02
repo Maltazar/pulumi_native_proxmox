@@ -20,19 +20,47 @@ else:
     from . import ProxmoxProvider, VM, VMGroup
 
 # Get configuration values
-config = pulumi.Config()
+config = pulumi.Config("pulumi-native-proxmox-dynamic")
 cloud_init_config = pulumi.Config("cloud_init")
 vm_user_config = pulumi.Config("vm_user")
 vm_setup_config = pulumi.Config("vm_setup")
 vm_group_config = pulumi.Config("vm_group")
 
 # Create the provider instance
+# Get authentication parameters
+endpoint = config.require("endpoint")
+username = config.get("username")
+password = config.get_secret("password")
+token_id = config.get("token_id")
+token_secret = config.get_secret("token_secret")
+
+# Determine which authentication method to use
+# If token parameters are provided and are not placeholder values, use tokens
+# Otherwise, fallback to username/password
+use_token_auth = token_id and token_secret and token_id != "string" and token_secret != "string"
+if use_token_auth:
+    print("Using token-based authentication")
+    provider_auth = {
+        "token_id": token_id,
+        "token_secret": token_secret,
+        # Set username/password to None to avoid confusion
+        "username": None,
+        "password": None
+    }
+else:
+    print("Using username/password authentication")
+    provider_auth = {
+        "username": username,
+        "password": password,
+        # Set token values to None to avoid confusion
+        "token_id": None,
+        "token_secret": None
+    }
+
+# Create provider with the selected authentication method
 provider = ProxmoxProvider(
-    endpoint=config.require("endpoint"),
-    username=config.get("username"),
-    password=config.get_secret("password"),
-    token_id=config.get("token_id"),
-    token_secret=config.get_secret("token_secret"),
+    endpoint=endpoint,
+    **provider_auth,
     node=config.get("node"),
     insecure=config.get_bool("insecure") or False,
     timeout=config.get_int("timeout") or 30,
@@ -109,23 +137,22 @@ if template_id:
             vm_start_id=vm_group_config.get_int("vm_start_id"),
             ip_range=vm_group_config.get("ip_range"),
             gateway=vm_group_config.get("gateway"),
-            args=vm_args
+            args=vm_args,
+            provider=provider
         )
         
-        # Export the VM IDs and IPs
+        # Export the VM IDs only
         vms_data = []
         for i, vm in enumerate(vm_group.vms):
             vms_data.append({
                 "name": f"{vm_group_prefix}-{i+1}",
-                "vmid": vm.vmid,
-                "ip": vm.ip
+                "vmid": vm.vmid
             })
         pulumi.export("vms", vms_data)
         
     else:
         # Create a single VM
-        vm = VM("vm", args=vm_args)
+        vm = VM("vm", args=vm_args, provider=provider)
         
-        # Export the VM ID and IP
-        pulumi.export("vmid", vm.vmid)
-        pulumi.export("ip", vm.ip) 
+        # Export only the VM ID
+        pulumi.export("vmid", vm.vmid) 
