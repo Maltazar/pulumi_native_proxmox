@@ -1,0 +1,60 @@
+name: pulumi-native-proxmox
+runtime:
+  name: python
+  options:
+    virtualenv: ../.venv
+
+description: A native Pulumi provider for Proxmox VE that allows you to create and manage VMs
+
+# Configuration schema
+config:
+  # Provider Configuration (proxmox:provider)
+  proxmox:endpoint: string
+  proxmox:username: string
+  proxmox:password: string
+  proxmox:token_id: string
+  proxmox:token_secret: string
+  proxmox:node: string
+  proxmox:insecure: boolean
+  proxmox:timeout: number
+  proxmox:debug: boolean
+
+  # VM Configuration (proxmox:vm:VM)
+  vm:template_id: string
+  vm:vmid: number
+  vm:cores: number
+  vm:sockets: number
+  vm:memory: number
+  vm:disk_size: string
+  vm:disk_storage: string
+  vm:network_bridge: string
+  vm:vlan_tag: number
+  vm:start_on_create: boolean
+  vm:wait_for_ssh: boolean
+
+  # Cloud-init Configuration
+  cloud_init:username: string
+  cloud_init:password: string
+  cloud_init:ssh_public_key: string
+  cloud_init:ssh_private_key: string
+  cloud_init:ssh_key_passphrase: string
+
+
+  # VM User Configuration
+  vm_user:create_admin_user: boolean
+  vm_user:username: string
+  vm_user:ssh_public_key: string
+  vm_user:ssh_private_key: string
+  vm_user:ssh_key_passphrase: string
+
+  # VM Group Configuration (proxmox:vm:VMGroup)
+  vm_group:prefix: string
+  vm_group:count: number
+  vm_group:vm_start_id: number
+  vm_group:ip_range: string
+  vm_group:gateway: string
+
+  # VM Setup Configuration
+  vm_setup:features: array
+  vm_setup:scripts: array
+  vm_setup:commands: array 
