@@ -18,6 +18,8 @@ import urllib.parse
 from .proxmox_client import ProxmoxClient
 from .provider import ProxmoxProvider
 
+# Configure module logger
+logger = logging.getLogger(__name__)
 
 class VMProvider(pulumi.dynamic.ResourceProvider):
     """Dynamic resource provider for Proxmox VMs."""
@@ -333,7 +335,7 @@ class VMProvider(pulumi.dynamic.ResourceProvider):
         )
         
         # Debug log the response
-        client.logger.debug(f"Clone response: {response}")
+        logger.debug(f"Clone response: {response}")
         
         # Wait for clone to complete - get the task ID from the response
         task_id = None
@@ -343,24 +345,29 @@ class VMProvider(pulumi.dynamic.ResourceProvider):
             # If response is a dictionary
             if 'data' in response:
                 task_id = response['data']
-                client.logger.debug(f"Found task ID in response['data']: {task_id}")
+                logger.debug(f"Found task ID in response['data']: {task_id}")
             else:
                 for key, value in response.items():
-                    client.logger.debug(f"Key: {key}, Value: {value}")
+                    logger.debug(f"Key: {key}, Value: {value}")
                     if key in ['upid', 'task_id']:
                         task_id = value
-                        client.logger.debug(f"Found task ID in key '{key}': {task_id}")
+                        logger.debug(f"Found task ID in key '{key}': {task_id}")
         elif isinstance(response, str):
             # If response is just a string, assume it's the task ID
             task_id = response
-            client.logger.debug(f"Response is string, using as task ID: {task_id}")
+            logger.debug(f"Response is string, using as task ID: {task_id}")
         
-        if task_id:
-            client.logger.debug(f"Waiting for specific task: {task_id}")
-            self._wait_for_specific_task(client, node, task_id)
-        else:
-            client.logger.debug("No task ID found, falling back to waiting for all tasks")
-            self._wait_for_task_completion(client, node)
+        if not task_id:
+            raise Exception("Failed to get task ID from clone response")
+            
+        logger.debug(f"Waiting for clone task: {task_id}")
+        self._wait_for_specific_task(client, node, task_id)
+        
+        # Verify VM exists after clone
+        try:
+            client.request('GET', f'/nodes/{node}/qemu/{vmid}/config')
+        except Exception as e:
+            raise Exception(f"Failed to verify VM {vmid} exists after clone: {str(e)}")
     
     def _configure_vm(self, client: ProxmoxClient, node: str, vmid: Union[int, float, str], 
                      props: Dict[str, Any]) -> None:
@@ -387,6 +394,7 @@ class VMProvider(pulumi.dynamic.ResourceProvider):
         
         # Disk configuration
         if props.get('disk_size'):
+            logger.debug(f"Resizing disk for VM {vmid} to {props.get('disk_size')}")
             # Resize disk
             response = client.request(
                 'PUT',
@@ -397,13 +405,38 @@ class VMProvider(pulumi.dynamic.ResourceProvider):
                 }
             )
             
+            logger.debug(f"Disk resize response: {response}")
+            
             # Wait for resize to complete
-            if 'data' in response and isinstance(response['data'], str):
-                task_id = response['data']
+            task_id = None
+            if isinstance(response, dict):
+                if 'data' in response:
+                    task_id = response['data']
+                    logger.debug(f"Found task ID in response['data']: {task_id}")
+                else:
+                    for key, value in response.items():
+                        if key in ['upid', 'task_id']:
+                            task_id = value
+                            logger.debug(f"Found task ID in key '{key}': {task_id}")
+            elif isinstance(response, str):
+                task_id = response
+                logger.debug(f"Response is string, using as task ID: {task_id}")
+
+            if task_id:
+                logger.debug(f"Waiting for disk resize task: {task_id}")
                 self._wait_for_specific_task(client, node, task_id)
             else:
-                # Fallback to waiting for all tasks
+                logger.warning("No task ID found in resize response, waiting for all tasks to complete")
                 self._wait_for_task_completion(client, node)
+
+            # Verify disk size after resize
+            try:
+                config_response = client.request('GET', f'/nodes/{node}/qemu/{vmid}/config')
+                if 'data' in config_response:
+                    disk_size = config_response['data'].get('scsi0')
+                    logger.debug(f"Current disk configuration after resize: {disk_size}")
+            except Exception as e:
+                logger.warning(f"Failed to verify disk size after resize: {e}")
         
         # Network configuration
         if props.get('network_bridge') or props.get('vlan_tag'):
@@ -739,52 +772,74 @@ class VMProvider(pulumi.dynamic.ResourceProvider):
             timeout: Timeout in seconds
         """
         start_time = time.time()
+        logger.debug(f"Waiting for task {task_id} on node {node}")
         
         while True:
-            # Get task status
             try:
+                # Get task status
                 task_status = client.request('GET', f'/nodes/{node}/tasks/{task_id}/status')
+                logger.debug(f"Task status response: {task_status}")
                 
-                # Check if task is done - handle different response formats
-                if isinstance(task_status, dict) and 'data' in task_status:
-                    status_data = task_status['data']
-                    if status_data.get('status') == 'stopped':
-                        # Check for errors
-                        if status_data.get('exitstatus') != 'OK':
-                            raise Exception(f"Task {task_id} failed with status: {status_data.get('exitstatus')}")
+                # Extract status data - handle both direct response and nested data
+                status_data = task_status.get('data', task_status)
+                if not isinstance(status_data, dict):
+                    logger.debug(f"Unexpected status data format: {status_data}")
+                    status_data = {}
+                
+                # Get detailed status information
+                task_status = status_data.get('status', 'unknown')
+                task_type = status_data.get('type', 'unknown')
+                task_exitstatus = status_data.get('exitstatus', 'unknown')
+                task_msg = status_data.get('msg', '')
+                
+                logger.debug(f"Task details - Status: {task_status}, Type: {task_type}, Exit: {task_exitstatus}, Msg: {task_msg}")
+                
+                # Check if task has stopped
+                if task_status == 'stopped':
+                    if task_exitstatus == 'OK':
+                        logger.debug(f"Task {task_id} completed successfully")
                         return
-                elif isinstance(task_status, dict):
-                    # Handle case where data might be directly in response
-                    if task_status.get('status') == 'stopped':
-                        if task_status.get('exitstatus') != 'OK':
-                            raise Exception(f"Task {task_id} failed with status: {task_status.get('exitstatus')}")
-                        return
+                    else:
+                        error = task_msg or 'Unknown error'
+                        raise Exception(f"Task {task_id} failed: {error} (exit status: {task_exitstatus})")
                 
             except Exception as e:
-                # If we can't get the task status, check if it's because the task is already gone
-                # which would indicate completion
-                try:
-                    # Get all tasks
-                    all_tasks_response = client.request('GET', f'/nodes/{node}/tasks')
-                    
-                    # Handle different response formats
-                    all_tasks = all_tasks_response
-                    if isinstance(all_tasks_response, dict) and 'data' in all_tasks_response:
-                        all_tasks = all_tasks_response['data']
-                    
-                    # Check if the task is in the list
-                    if not any(t.get('upid') == task_id for t in all_tasks):
-                        # Task is no longer in the list, assume it completed
-                        return
-                except Exception as inner_e:
-                    # If we can't check the task list either, log it and continue
-                    pass
+                # Handle task not found case
+                if "not found" in str(e).lower():
+                    logger.debug(f"Task {task_id} not found, checking task history")
+                    try:
+                        # Get recent tasks
+                        all_tasks = client.request('GET', f'/nodes/{node}/tasks')
+                        tasks = all_tasks.get('data', [])
+                        if not isinstance(tasks, list):
+                            tasks = []
+                        
+                        # Look for our task in recent history
+                        for task in tasks:
+                            if task.get('upid') == task_id:
+                                status = task.get('status')
+                                exitstatus = task.get('exitstatus')
+                                msg = task.get('msg', '')
+                                
+                                logger.debug(f"Found task in history - Status: {status}, Exit: {exitstatus}, Msg: {msg}")
+                                
+                                if status == 'stopped' and exitstatus == 'OK':
+                                    logger.debug(f"Task {task_id} completed successfully (verified from task history)")
+                                    return
+                                elif status == 'stopped':
+                                    raise Exception(f"Task {task_id} failed: {msg or 'Unknown error'}")
+                                
+                        logger.debug(f"Task {task_id} not found in recent history, continuing to wait")
+                    except Exception as inner_e:
+                        logger.debug(f"Error checking task history: {inner_e}")
+                else:
+                    logger.debug(f"Error checking task status: {e}")
             
             # Check timeout
             if time.time() - start_time > timeout:
                 raise Exception(f"Timeout waiting for task {task_id} to complete on node {node}")
             
-            # Wait and check again
+            # Wait before checking again
             time.sleep(2)
 
     def _wait_for_task_completion(self, client: ProxmoxClient, node: str, 
