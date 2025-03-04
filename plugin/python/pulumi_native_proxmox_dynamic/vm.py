@@ -181,6 +181,7 @@ class VMProvider(pulumi.dynamic.ResourceProvider):
         vmid = int(vmid_str)  # Explicitly convert to integer
         
         client = self._get_client(news)
+        logger.debug(f"Updating VM {vmid} on node {node}")
         
         # Determine if we need to stop the VM to apply changes
         requires_stop = False
@@ -191,15 +192,42 @@ class VMProvider(pulumi.dynamic.ResourceProvider):
         for prop in stop_required_props:
             if prop in news and prop in olds and news[prop] != olds[prop]:
                 requires_stop = True
+                logger.debug(f"Property {prop} changed from {olds[prop]} to {news[prop]}, requires VM stop")
                 break
         
         # Get VM status
         vm_status = client.request('GET', f'/nodes/{node}/qemu/{vmid}/status/current')
         was_running = vm_status.get('data', {}).get('status') == 'running'
+        logger.debug(f"Current VM status: {vm_status.get('data', {}).get('status')}")
         
         # Stop VM if needed
         if requires_stop and was_running:
-            client.request('POST', f'/nodes/{node}/qemu/{vmid}/status/stop')
+            logger.debug(f"Stopping VM {vmid} for update")
+            response = client.request('POST', f'/nodes/{node}/qemu/{vmid}/status/stop')
+            logger.debug(f"Stop response: {response}")
+            
+            # Wait for stop task to complete
+            task_id = None
+            if isinstance(response, dict):
+                if 'data' in response:
+                    task_id = response['data']
+                    logger.debug(f"Found task ID in response['data']: {task_id}")
+                else:
+                    for key, value in response.items():
+                        if key in ['upid', 'task_id']:
+                            task_id = value
+                            logger.debug(f"Found task ID in key '{key}': {task_id}")
+            elif isinstance(response, str):
+                task_id = response
+                logger.debug(f"Response is string, using as task ID: {task_id}")
+
+            if task_id:
+                logger.debug(f"Waiting for stop task: {task_id}")
+                self._wait_for_specific_task(client, node, task_id)
+            else:
+                logger.warning("No task ID found in stop response, waiting for all tasks to complete")
+                self._wait_for_task_completion(client, node)
+            
             self._wait_for_vm_state(client, node, vmid, 'stopped')
         
         # Update VM configuration
@@ -223,15 +251,24 @@ class VMProvider(pulumi.dynamic.ResourceProvider):
         
         # Apply configuration updates if any
         if config_updates:
-            client.request(
+            logger.debug(f"Applying configuration updates: {config_updates}")
+            response = client.request(
                 'POST',
                 f'/nodes/{node}/qemu/{vmid}/config',
                 data=config_updates
             )
+            logger.debug(f"Config update response: {response}")
+            
+            # Wait for config update task if one was returned
+            if isinstance(response, dict) and 'data' in response and isinstance(response['data'], str):
+                task_id = response['data']
+                logger.debug(f"Waiting for config update task: {task_id}")
+                self._wait_for_specific_task(client, node, task_id)
         
         # Disk size update (can be done while VM is running in newer Proxmox versions)
         if 'disk_size' in news and news['disk_size'] != olds.get('disk_size'):
-            client.request(
+            logger.debug(f"Resizing disk to {news['disk_size']}")
+            response = client.request(
                 'PUT',
                 f'/nodes/{node}/qemu/{vmid}/resize',
                 params={
@@ -239,10 +276,67 @@ class VMProvider(pulumi.dynamic.ResourceProvider):
                     'size': news['disk_size'],
                 }
             )
+            logger.debug(f"Disk resize response: {response}")
+            
+            # Wait for resize task to complete
+            task_id = None
+            if isinstance(response, dict):
+                if 'data' in response:
+                    task_id = response['data']
+                    logger.debug(f"Found task ID in response['data']: {task_id}")
+                else:
+                    for key, value in response.items():
+                        if key in ['upid', 'task_id']:
+                            task_id = value
+                            logger.debug(f"Found task ID in key '{key}': {task_id}")
+            elif isinstance(response, str):
+                task_id = response
+                logger.debug(f"Response is string, using as task ID: {task_id}")
+
+            if task_id:
+                logger.debug(f"Waiting for resize task: {task_id}")
+                self._wait_for_specific_task(client, node, task_id)
+            else:
+                logger.warning("No task ID found in resize response, waiting for all tasks to complete")
+                self._wait_for_task_completion(client, node)
+
+            # Verify disk size after resize
+            try:
+                config_response = client.request('GET', f'/nodes/{node}/qemu/{vmid}/config')
+                if 'data' in config_response:
+                    disk_size = config_response['data'].get('scsi0')
+                    logger.debug(f"Current disk configuration after resize: {disk_size}")
+            except Exception as e:
+                logger.warning(f"Failed to verify disk size after resize: {e}")
         
         # Restart VM if it was running before
         if requires_stop and was_running:
-            client.request('POST', f'/nodes/{node}/qemu/{vmid}/status/start')
+            logger.debug(f"Starting VM {vmid} after update")
+            response = client.request('POST', f'/nodes/{node}/qemu/{vmid}/status/start')
+            logger.debug(f"Start response: {response}")
+            
+            # Wait for start task to complete
+            task_id = None
+            if isinstance(response, dict):
+                if 'data' in response:
+                    task_id = response['data']
+                    logger.debug(f"Found task ID in response['data']: {task_id}")
+                else:
+                    for key, value in response.items():
+                        if key in ['upid', 'task_id']:
+                            task_id = value
+                            logger.debug(f"Found task ID in key '{key}': {task_id}")
+            elif isinstance(response, str):
+                task_id = response
+                logger.debug(f"Response is string, using as task ID: {task_id}")
+
+            if task_id:
+                logger.debug(f"Waiting for start task: {task_id}")
+                self._wait_for_specific_task(client, node, task_id)
+            else:
+                logger.warning("No task ID found in start response, waiting for all tasks to complete")
+                self._wait_for_task_completion(client, node)
+            
             self._wait_for_vm_state(client, node, vmid, 'running')
         
         return pulumi.dynamic.UpdateResult(outs=news)
@@ -261,17 +355,84 @@ class VMProvider(pulumi.dynamic.ResourceProvider):
         client = self._get_client(props)
         
         # Get VM status
-        vm_status = client.request('GET', f'/nodes/{node}/qemu/{vmid}/status/current')
-        
-        # Stop VM if running
-        if vm_status.get('data', {}).get('status') == 'running':
-            client.request('POST', f'/nodes/{node}/qemu/{vmid}/status/stop')
+        try:
+            vm_status = client.request('GET', f'/nodes/{node}/qemu/{vmid}/status/current')
+            current_status = vm_status.get('data', {}).get('status')
+            logger.debug(f"Current VM status before deletion: {current_status}")
             
-            # Wait for VM to stop
-            self._wait_for_vm_state(client, node, vmid, 'stopped')
-        
-        # Delete VM
-        client.request('DELETE', f'/nodes/{node}/qemu/{vmid}')
+            # Stop VM if running
+            if current_status == 'running':
+                logger.debug(f"Stopping VM {vmid} before deletion")
+                response = client.request('POST', f'/nodes/{node}/qemu/{vmid}/status/stop')
+                logger.debug(f"Stop response: {response}")
+                
+                # Wait for stop task to complete
+                task_id = None
+                if isinstance(response, dict):
+                    if 'data' in response:
+                        task_id = response['data']
+                        logger.debug(f"Found task ID in response['data']: {task_id}")
+                    else:
+                        for key, value in response.items():
+                            if key in ['upid', 'task_id']:
+                                task_id = value
+                                logger.debug(f"Found task ID in key '{key}': {task_id}")
+                elif isinstance(response, str):
+                    task_id = response
+                    logger.debug(f"Response is string, using as task ID: {task_id}")
+
+                if task_id:
+                    logger.debug(f"Waiting for stop task: {task_id}")
+                    self._wait_for_specific_task(client, node, task_id)
+                else:
+                    logger.warning("No task ID found in stop response, waiting for all tasks to complete")
+                    self._wait_for_task_completion(client, node)
+                
+                # Wait for VM to stop
+                self._wait_for_vm_state(client, node, vmid, 'stopped')
+            
+            # Delete VM
+            logger.debug(f"Deleting VM {vmid}")
+            response = client.request('DELETE', f'/nodes/{node}/qemu/{vmid}')
+            logger.debug(f"Delete response: {response}")
+            
+            # Wait for delete task to complete
+            task_id = None
+            if isinstance(response, dict):
+                if 'data' in response:
+                    task_id = response['data']
+                    logger.debug(f"Found task ID in response['data']: {task_id}")
+                else:
+                    for key, value in response.items():
+                        if key in ['upid', 'task_id']:
+                            task_id = value
+                            logger.debug(f"Found task ID in key '{key}': {task_id}")
+            elif isinstance(response, str):
+                task_id = response
+                logger.debug(f"Response is string, using as task ID: {task_id}")
+
+            if task_id:
+                logger.debug(f"Waiting for delete task: {task_id}")
+                self._wait_for_specific_task(client, node, task_id)
+            else:
+                logger.warning("No task ID found in delete response, waiting for all tasks to complete")
+                self._wait_for_task_completion(client, node)
+            
+            # Verify VM is gone
+            try:
+                client.request('GET', f'/nodes/{node}/qemu/{vmid}/status/current')
+                raise Exception(f"VM {vmid} still exists after deletion")
+            except Exception as e:
+                if "not found" in str(e).lower():
+                    logger.debug(f"VM {vmid} successfully deleted")
+                else:
+                    raise
+                    
+        except Exception as e:
+            if "not found" in str(e).lower():
+                logger.debug(f"VM {vmid} already deleted")
+            else:
+                raise
     
     def _get_client(self, props: Dict[str, Any]) -> ProxmoxClient:
         """Get a Proxmox API client using the provided properties.
@@ -489,12 +650,31 @@ class VMProvider(pulumi.dynamic.ResourceProvider):
             node: Proxmox node
             vmid: VM ID
         """
+        logger.debug(f"Starting VM {vmid} on node {node}")
         response = client.request('POST', f'/nodes/{node}/qemu/{vmid}/status/start')
+        logger.debug(f"Start response: {response}")
         
         # Wait for the start task to complete
-        if 'data' in response and isinstance(response['data'], str):
-            task_id = response['data']
+        task_id = None
+        if isinstance(response, dict):
+            if 'data' in response:
+                task_id = response['data']
+                logger.debug(f"Found task ID in response['data']: {task_id}")
+            else:
+                for key, value in response.items():
+                    if key in ['upid', 'task_id']:
+                        task_id = value
+                        logger.debug(f"Found task ID in key '{key}': {task_id}")
+        elif isinstance(response, str):
+            task_id = response
+            logger.debug(f"Response is string, using as task ID: {task_id}")
+
+        if task_id:
+            logger.debug(f"Waiting for start task: {task_id}")
             self._wait_for_specific_task(client, node, task_id)
+        else:
+            logger.warning("No task ID found in start response, waiting for all tasks to complete")
+            self._wait_for_task_completion(client, node)
         
         # Then wait for VM to reach running state
         self._wait_for_vm_state(client, node, vmid, 'running')
