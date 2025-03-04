@@ -14,6 +14,8 @@ import base64
 from typing import Any, Dict, List, Optional, Union, Tuple, Callable
 import logging
 import urllib.parse
+import io
+import socket
 
 from .proxmox_client import ProxmoxClient
 from .provider import ProxmoxProvider
@@ -57,15 +59,63 @@ class VMProvider(pulumi.dynamic.ResourceProvider):
         # Clone the template
         self._clone_template(client, node, template_id, vmid, props)
         
-        # Configure VM
+        # Build initial configuration
+        config = {}
+        
+        # Network configuration (ipconfig0)
+        if 'ipconfig0' in props:
+            logger.info(f"Setting static IP configuration for VM {vmid}")
+            config['ipconfig0'] = props['ipconfig0']
+            logger.debug(f"IP configuration: {props['ipconfig0']}")
+        
+        # Apply initial configuration if any
+        if config:
+            logger.info(f"Applying initial configuration to VM {vmid}")
+            try:
+                response = client.request(
+                    'POST',
+                    f'/nodes/{node}/qemu/{vmid}/config',
+                    data=config
+                )
+                logger.debug(f"Initial configuration response: {response}")
+                
+                # Wait for configuration to be applied
+                if isinstance(response, dict) and response.get('data'):
+                    task_id = response['data']
+                    logger.debug(f"Waiting for initial configuration task: {task_id}")
+                    self._wait_for_specific_task(client, node, task_id)
+            except Exception as e:
+                raise Exception(f"Failed to apply initial configuration: {str(e)}")
+        
+        # Configure remaining VM settings
         self._configure_vm(client, node, vmid, props)
         
-        # Start VM if requested
-        if props.get('start_on_create', True):
+        # Start VM if requested - handle string or boolean value
+        start_on_create = props.get('start_on_create')
+        should_start = True  # default value
+        if isinstance(start_on_create, str):
+            should_start = start_on_create.lower() == 'true'
+        elif isinstance(start_on_create, bool):
+            should_start = start_on_create
+            
+        logger.debug(f"Start on create: {should_start} (raw value: {start_on_create})")
+        
+        if should_start:
+            logger.debug(f"Starting VM {vmid}")
             self._start_vm(client, node, vmid)
             
-            # Wait for VM to be ready if requested
-            if props.get('wait_for_ssh', False):
+            # Wait for VM to be ready if requested - handle string or boolean value
+            wait_for_ssh = props.get('wait_for_ssh')
+            should_wait = False  # default value
+            if isinstance(wait_for_ssh, str):
+                should_wait = wait_for_ssh.lower() == 'true'
+            elif isinstance(wait_for_ssh, bool):
+                should_wait = wait_for_ssh
+                
+            logger.debug(f"Wait for SSH: {should_wait} (raw value: {wait_for_ssh})")
+            
+            if should_wait:
+                logger.debug(f"Waiting for IP address for VM {vmid}")
                 ip_address = self._wait_for_ip_address(client, node, vmid)
                 
                 # Setup VM if cloud_init data is provided
@@ -530,195 +580,146 @@ class VMProvider(pulumi.dynamic.ResourceProvider):
         except Exception as e:
             raise Exception(f"Failed to verify VM {vmid} exists after clone: {str(e)}")
     
-    def _configure_vm(self, client: ProxmoxClient, node: str, vmid: Union[int, float, str], 
-                     props: Dict[str, Any]) -> None:
-        """Configure a VM after cloning.
+    def _configure_vm(self, client: ProxmoxClient, node: str, vmid: int, props: dict):
+        """Configure a VM with the given properties."""
+        logger.info(f"Starting VM {vmid} configuration process")
         
-        Args:
-            client: ProxmoxClient instance
-            node: Proxmox node
-            vmid: VM ID
-            props: Resource properties
-        """
-        vmid = int(vmid)  # Ensure vmid is an integer
+        # Track configuration tasks
+        tasks = {
+            'compute': {'status': 'pending', 'subtasks': ['cores', 'sockets', 'memory']},
+            'disk': {'status': 'pending', 'subtasks': ['resize']},
+            'network': {'status': 'pending', 'subtasks': ['bridge', 'vlan']},
+            'cloud_init': {'status': 'pending', 'subtasks': ['user', 'ssh_key']}
+        }
         
-        # Build configuration object
-        config = {}
-        
-        # Compute resources
-        if props.get('cores'):
-            config['cores'] = int(props.get('cores'))
-        if props.get('sockets'):
-            config['sockets'] = int(props.get('sockets'))
-        if props.get('memory'):
-            config['memory'] = int(props.get('memory'))
-        
-        # Disk configuration
-        if props.get('disk_size'):
-            logger.debug(f"Resizing disk for VM {vmid} to {props.get('disk_size')}")
-            # Resize disk
-            response = client.request(
-                'PUT',
-                f'/nodes/{node}/qemu/{vmid}/resize',
-                params={
-                    'disk': 'scsi0',
-                    'size': props.get('disk_size'),
-                }
-            )
+        try:
+            # Build configuration object
+            config = {}
             
-            logger.debug(f"Disk resize response: {response}")
+            # Compute resources
+            logger.info(f"Configuring compute resources for VM {vmid}")
+            tasks['compute']['status'] = 'in_progress'
+            if props.get('cores'):
+                logger.debug(f"Setting cores to {props.get('cores')}")
+                config['cores'] = int(props.get('cores'))
+                tasks['compute']['subtasks'][0] = 'cores ✓'
+            if props.get('sockets'):
+                logger.debug(f"Setting sockets to {props.get('sockets')}")
+                config['sockets'] = int(props.get('sockets'))
+                tasks['compute']['subtasks'][1] = 'sockets ✓'
+            if props.get('memory'):
+                logger.debug(f"Setting memory to {props.get('memory')}MB")
+                config['memory'] = int(props.get('memory'))
+                tasks['compute']['subtasks'][2] = 'memory ✓'
+            tasks['compute']['status'] = 'completed'
             
-            # Wait for resize to complete
-            task_id = None
-            if isinstance(response, dict):
-                if 'data' in response:
-                    task_id = response['data']
-                    logger.debug(f"Found task ID in response['data']: {task_id}")
-                else:
-                    for key, value in response.items():
-                        if key in ['upid', 'task_id']:
-                            task_id = value
-                            logger.debug(f"Found task ID in key '{key}': {task_id}")
-            elif isinstance(response, str):
-                task_id = response
-                logger.debug(f"Response is string, using as task ID: {task_id}")
-
-            if task_id:
-                logger.debug(f"Waiting for disk resize task: {task_id}")
-                self._wait_for_specific_task(client, node, task_id)
-            else:
-                logger.warning("No task ID found in resize response, waiting for all tasks to complete")
-                self._wait_for_task_completion(client, node)
-
-            # Verify disk size after resize
-            try:
-                config_response = client.request('GET', f'/nodes/{node}/qemu/{vmid}/config')
-                if 'data' in config_response:
-                    disk_size = config_response['data'].get('scsi0')
-                    logger.debug(f"Current disk configuration after resize: {disk_size}")
-            except Exception as e:
-                logger.warning(f"Failed to verify disk size after resize: {e}")
-        
-        # Network configuration
-        if props.get('network_bridge') or props.get('vlan_tag'):
-            net_config = f'model=virtio,bridge={props.get("network_bridge", "vmbr0")}'
-            if props.get('vlan_tag'):
-                net_config += f',tag={int(props.get("vlan_tag"))}'
-            config['net0'] = net_config
-        
-        # Cloud-init configuration
-        if props.get('cloud_init_user'):
-            config['ciuser'] = props.get('cloud_init_user')
-        
-        # Handle SSH key for cloud-init
-        ssh_key = props.get('cloud_init_ssh_public_key')
-        if ssh_key:
-            # If ssh_key is a file path, read it
-            if ssh_key.startswith('/') and os.path.exists(ssh_key):
-                with open(ssh_key, 'r') as f:
-                    ssh_key = f.read().strip()
+            # Network configuration
+            logger.info(f"Starting network configuration for VM {vmid}")
+            tasks['network']['status'] = 'in_progress'
             
-            # URL encode the SSH key - properly format without newlines
-            # Proxmox expects a properly formatted SSH key
-            ssh_key = ssh_key.replace('\n', '')
-            config['sshkeys'] = urllib.parse.quote(ssh_key)
+            if props.get('network_bridge'):
+                net_config = f'model=virtio,bridge={props.get("network_bridge")}'
+                if props.get('vlan_tag'):
+                    logger.debug(f"Adding VLAN tag {props.get('vlan_tag')}")
+                    net_config += f',tag={int(props.get("vlan_tag"))}'
+                config['net0'] = net_config
+                tasks['network']['subtasks'][0] = 'bridge ✓'
+                if props.get('vlan_tag'):
+                    tasks['network']['subtasks'][1] = f'vlan {props.get("vlan_tag")} ✓'
+            tasks['network']['status'] = 'completed'
             
-            # Log the SSH key being set (without the actual key content)
-            logger.debug(f"Setting cloud-init SSH key for user {props.get('cloud_init_user')}")
-            
-        # DNS configuration if provided
-        if props.get('cloud_init_dns_domain'):
-            config['searchdomain'] = props.get('cloud_init_dns_domain')
-        if props.get('cloud_init_dns_servers'):
-            config['nameserver'] = props.get('cloud_init_dns_servers')
-            
-        # IP configuration if provided
-        if props.get('cloud_init_ip_config'):
-            config['ipconfig0'] = props.get('cloud_init_ip_config')
-        
-        # Enable Proxmox agent if requested in VM setup features
-        vm_setup_features = props.get('vm_setup_features', [])
-        if isinstance(vm_setup_features, str):
-            vm_setup_features = [vm_setup_features]
-            
-        if 'proxmox_agent' in vm_setup_features:
-            config['agent'] = 1
-        
-        # Apply configuration if any
-        if config:
-            logger.debug(f"Applying VM configuration for {vmid}: {config}")
-            try:
-                # First get current config to compare
-                current = client.request('GET', f'/nodes/{node}/qemu/{vmid}/config')
-                logger.debug(f"Current VM config before changes: {current}")
+            # Apply configuration if any
+            if config:
+                logger.info(f"Applying configuration to VM {vmid}")
+                response = client.request(
+                    'POST',
+                    f'/nodes/{node}/qemu/{vmid}/config',
+                    data=config
+                )
+                logger.debug(f"Configuration response: {response}")
                 
-                # Apply changes in smaller batches to isolate issues
-                for key, value in config.items():
-                    try:
-                        logger.debug(f"Applying config {key}={value} to VM {vmid}")
-                        batch_config = {key: value}
-                        response = client.request(
-                            'POST',
-                            f'/nodes/{node}/qemu/{vmid}/config',
-                            data=batch_config
-                        )
-                        logger.debug(f"Config update response for {key}: {response}")
-                        
-                        # Some config changes might return a task ID
-                        task_id = None
-                        if isinstance(response, dict):
-                            if 'data' in response:
-                                task_id = response['data']
-                                logger.debug(f"Found task ID in response['data']: {task_id}")
-                            else:
-                                for k, v in response.items():
-                                    if k in ['upid', 'task_id']:
-                                        task_id = v
-                                        logger.debug(f"Found task ID in key '{k}': {task_id}")
-                        elif isinstance(response, str):
-                            task_id = response
-                            logger.debug(f"Response is string, using as task ID: {task_id}")
-
-                        if task_id:
-                            logger.debug(f"Waiting for config update task: {task_id}")
-                            self._wait_for_specific_task(client, node, task_id)
-                            # Add a small delay between configuration changes
-                            time.sleep(1)
-                            
-                        # Verify this specific change
-                        verify_response = client.request('GET', f'/nodes/{node}/qemu/{vmid}/config')
-                        if 'data' in verify_response:
-                            current_value = verify_response['data'].get(key)
-                            logger.debug(f"Verifying {key}: expected={value}, current={current_value}")
-                            if str(current_value) != str(value):
-                                logger.warning(f"Configuration mismatch for {key}: expected {value}, got {current_value}")
-                                
-                    except Exception as e:
-                        error_msg = str(e)
-                        logger.error(f"Failed to apply configuration {key}={value}: {error_msg}")
-                        if "permission denied" in error_msg.lower():
-                            raise Exception(f"Permission denied while configuring VM {vmid}. Check your API token permissions.")
-                        elif "invalid parameter" in error_msg.lower():
-                            raise Exception(f"Invalid configuration parameter '{key}' for VM {vmid}: {error_msg}")
-                        else:
-                            raise Exception(f"Failed to configure VM {vmid} parameter '{key}': {error_msg}")
-                            
-                # Final verification of all changes
-                try:
-                    final_config = client.request('GET', f'/nodes/{node}/qemu/{vmid}/config')
-                    logger.debug(f"Final VM configuration: {final_config}")
-                except Exception as e:
-                    logger.warning(f"Failed to get final configuration: {e}")
-                    
-            except Exception as e:
-                error_msg = str(e)
-                logger.error(f"Failed to apply configuration: {error_msg}")
-                if "permission denied" in error_msg.lower():
-                    raise Exception(f"Permission denied while configuring VM {vmid}. Check your API token permissions.")
-                elif "invalid parameter" in error_msg.lower():
-                    raise Exception(f"Invalid configuration parameter for VM {vmid}: {error_msg}")
-                else:
-                    raise Exception(f"Failed to configure VM {vmid}: {error_msg}")
+                # Wait for any configuration tasks to complete
+                self._wait_for_task_completion(client, node)
+            
+            # Disk configuration
+            logger.info(f"Starting disk configuration for VM {vmid}")
+            tasks['disk']['status'] = 'in_progress'
+            
+            if props.get('disk_size'):
+                logger.info(f"Initiating disk resize for VM {vmid} to {props.get('disk_size')}")
+                tasks['disk']['subtasks'][0] = 'resize (in progress)'
+                
+                # First get current config to verify disk name
+                config_response = client.request('GET', f'/nodes/{node}/qemu/{vmid}/config')
+                disk_name = 'scsi0'  # default
+                if 'data' in config_response:
+                    # Find the first SCSI disk
+                    for key in config_response['data'].keys():
+                        if key.startswith('scsi'):
+                            disk_name = key
+                            break
+                logger.debug(f"Using disk {disk_name} for resize operation")
+                
+                # Resize disk
+                resize_response = client.request(
+                    'PUT',
+                    f'/nodes/{node}/qemu/{vmid}/resize',
+                    params={
+                        'disk': disk_name,
+                        'size': props.get('disk_size'),
+                    }
+                )
+                logger.debug(f"Disk resize response: {resize_response}")
+                
+                # Wait for resize task if one was created
+                if isinstance(resize_response, dict) and resize_response.get('data'):
+                    task_id = resize_response['data']
+                    logger.info(f"Waiting for disk resize task {task_id}")
+                    self._wait_for_specific_task(client, node, task_id)
+                tasks['disk']['subtasks'][0] = 'resize ✓'
+            
+            # Cloud-init configuration
+            logger.info(f"Starting cloud-init configuration for VM {vmid}")
+            tasks['cloud_init']['status'] = 'in_progress'
+            
+            cloud_init_config = {}
+            if props.get('cloud_init_user'):
+                logger.debug(f"Setting cloud-init user to {props.get('cloud_init_user')}")
+                cloud_init_config['ciuser'] = props.get('cloud_init_user')
+                tasks['cloud_init']['subtasks'][0] = 'user ✓'
+            
+            if props.get('ssh_public_keys'):
+                logger.debug("Processing SSH key for cloud-init")
+                cloud_init_config['sshkeys'] = urllib.parse.quote(props.get('ssh_public_keys'))
+                tasks['cloud_init']['subtasks'][1] = 'ssh_key ✓'
+            
+            if cloud_init_config:
+                response = client.request(
+                    'POST',
+                    f'/nodes/{node}/qemu/{vmid}/config',
+                    data=cloud_init_config
+                )
+                logger.debug(f"Cloud-init configuration response: {response}")
+            tasks['cloud_init']['status'] = 'completed'
+            
+            # Log final configuration status
+            logger.info("Configuration tasks completed:")
+            for task_name, task_info in tasks.items():
+                logger.info(f"- {task_name}: {task_info['status']}")
+                for subtask in task_info['subtasks']:
+                    if '✓' in subtask:
+                        logger.info(f"  - {subtask}")
+            
+            return True
+            
+        except Exception as e:
+            logger.error(f"Failed during VM configuration. Task status:")
+            for task_name, task_info in tasks.items():
+                logger.error(f"- {task_name}: {task_info['status']}")
+                for subtask in task_info['subtasks']:
+                    if '✓' in subtask:
+                        logger.error(f"  - {subtask}")
+            raise Exception(f"Failed to configure VM: {str(e)}")
     
     def _start_vm(self, client: ProxmoxClient, node: str, vmid: int) -> None:
         """Start a VM.
@@ -784,9 +785,12 @@ class VMProvider(pulumi.dynamic.ResourceProvider):
         """Wait for VM to get an IP address."""
         vmid = int(vmid)  # Ensure vmid is an integer
         start_time = time.time()
+        logger.info(f"Waiting for IP address for VM {vmid}")
+
         while time.time() - start_time < timeout:
-            # Check if agent is working
+            # Method 1: Try QEMU agent
             try:
+                logger.debug("Attempting to get IP via QEMU agent")
                 response = client.request(
                     "GET", 
                     f"/nodes/{node}/qemu/{vmid}/agent/network-get-interfaces"
@@ -795,38 +799,68 @@ class VMProvider(pulumi.dynamic.ResourceProvider):
                 interfaces = response.get('data', [])
                 for interface in interfaces:
                     if interface.get('name') != 'lo':
+                        logger.debug(f"Found interface: {interface.get('name')}")
                         for ip_info in interface.get('ip-addresses', []):
-                            if ip_info.get('ip-address-type') == 'ipv4':
-                                ip = ip_info.get('ip-address')
-                                if ip and not ip.startswith('127.'):
-                                    logging.info(f"Found IP address: {ip}")
-                                    return ip
+                            ip = ip_info.get('ip-address')
+                            ip_type = ip_info.get('ip-address-type')
+                            logger.debug(f"Found IP: {ip} (type: {ip_type})")
+                            if ip_type == 'ipv4' and ip and not ip.startswith('127.'):
+                                logger.info(f"Found IP address via QEMU agent: {ip}")
+                                return ip
             except Exception as e:
-                logging.info(f"Error getting agent info: {e}")
+                logger.debug(f"QEMU agent method failed: {str(e)}")
                 
-            # Fallback - try to get IP from Proxmox
+            # Method 2: Try cloud-init config
             try:
+                logger.debug("Attempting to get IP from cloud-init config")
                 response = client.request(
                     "GET", 
                     f"/nodes/{node}/qemu/{vmid}/config"
                 )
-                ipconfig = []
-                for key, value in response.get('data', {}).items():
-                    if key.startswith('ipconfig'):
-                        ipconfig.append(value)
-                        
-                for config in ipconfig:
-                    if config and 'ip=' in config:
-                        ip = config.split('ip=')[1].split('/')[0]
-                        if ip and not ip.startswith('127.'):
-                            logging.info(f"Found IP address from config: {ip}")
-                            return ip
-            except Exception as e:
-                logging.info(f"Error getting config info: {e}")
+                config = response.get('data', {})
                 
+                # Check ipconfig entries
+                for key, value in config.items():
+                    if key.startswith('ipconfig'):
+                        logger.debug(f"Found ipconfig entry: {value}")
+                        if value and 'ip=' in value:
+                            ip = value.split('ip=')[1].split('/')[0]
+                            if ip and not ip.startswith('127.'):
+                                logger.info(f"Found IP address from cloud-init config: {ip}")
+                                return ip
+            except Exception as e:
+                logger.debug(f"Cloud-init config method failed: {str(e)}")
+
+            # Method 3: Try getting IP from VM status
+            try:
+                logger.debug("Attempting to get IP from VM status")
+                response = client.request(
+                    "GET",
+                    f"/nodes/{node}/qemu/{vmid}/status/current"
+                )
+                status = response.get('data', {})
+                if 'ip-address' in status:
+                    ip = status['ip-address']
+                    if ip and not ip.startswith('127.'):
+                        logger.info(f"Found IP address from VM status: {ip}")
+                        return ip
+                
+                # Also check network interfaces in status
+                net = status.get('net', {})
+                for iface in net.values():
+                    if isinstance(iface, dict) and 'ip-addresses' in iface:
+                        for ip in iface['ip-addresses']:
+                            if ip and not ip.startswith('127.'):
+                                logger.info(f"Found IP address from network status: {ip}")
+                                return ip
+            except Exception as e:
+                logger.debug(f"VM status method failed: {str(e)}")
+
+            # If we haven't found an IP yet, wait before retrying
+            logger.debug(f"No IP address found yet for VM {vmid}, waiting...")
             time.sleep(5)
         
-        logging.warning(f"Timeout waiting for VM {vmid} to get an IP address")
+        logger.warning(f"Timeout waiting for VM {vmid} to get an IP address")
         return None
     
     def _setup_vm(self, client: ProxmoxClient, node: str, vmid: Union[int, float, str], 
@@ -855,27 +889,59 @@ class VMProvider(pulumi.dynamic.ResourceProvider):
         ssh = paramiko.SSHClient()
         ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
         
-        # Connect to the VM
         try:
             # Try to connect with SSH key if provided
             if ssh_key_path:
-                # If the ssh_key is a file path, read it
-                key_data = None
-                if ssh_key_path.startswith('/') and os.path.exists(ssh_key_path):
-                    with open(ssh_key_path, 'rb') as f:
-                        key_data = f.read()
-                else:
-                    # Assume it's the actual key data
-                    key_data = ssh_key_path.encode('utf-8')
-                
-                key = paramiko.RSAKey.from_private_key(
-                    paramiko.PKey.from_private_key_data(key_data, 
-                                                      password=props.get('cloud_init_ssh_key_passphrase'))
-                )
-                ssh.connect(ip_address, username=username, pkey=key)
+                try:
+                    # If the ssh_key is a file path, read it
+                    if ssh_key_path.startswith('/') and os.path.exists(ssh_key_path):
+                        logger.debug(f"Loading SSH key from file: {ssh_key_path}")
+                        key = paramiko.RSAKey.from_private_key_file(
+                            ssh_key_path,
+                            password=props.get('cloud_init_ssh_key_passphrase')
+                        )
+                    else:
+                        # Assume it's the actual key data
+                        logger.debug("Loading SSH key from provided key data")
+                        key_file = io.StringIO(ssh_key_path)
+                        key = paramiko.RSAKey.from_private_key(
+                            key_file,
+                            password=props.get('cloud_init_ssh_key_passphrase')
+                        )
+                    
+                    logger.debug(f"Attempting SSH connection to {ip_address} with key authentication")
+                    ssh.connect(ip_address, username=username, pkey=key)
+                    
+                except (paramiko.ssh_exception.SSHException, 
+                       paramiko.ssh_exception.PasswordRequiredException) as e:
+                    logger.warning(f"Failed to load SSH key: {str(e)}")
+                    if password:
+                        logger.debug("Falling back to password authentication")
+                        ssh.connect(ip_address, username=username, password=password)
+                    else:
+                        raise
             else:
                 # Connect with password
+                logger.debug(f"Attempting SSH connection to {ip_address} with password authentication")
                 ssh.connect(ip_address, username=username, password=password)
+            
+            def run_command(command: str, check_exit: bool = True) -> Tuple[int, str, str]:
+                """Run a command and return exit code, stdout, and stderr."""
+                logger.debug(f"Running command: {command}")
+                stdin, stdout, stderr = ssh.exec_command(command)
+                exit_status = stdout.channel.recv_exit_status()
+                out = stdout.read().decode().strip()
+                err = stderr.read().decode().strip()
+                
+                if out:
+                    logger.debug(f"Command output: {out}")
+                if err:
+                    logger.warning(f"Command error output: {err}")
+                
+                if check_exit and exit_status != 0:
+                    raise Exception(f"Command failed with exit status {exit_status}: {err or out}")
+                
+                return exit_status, out, err
             
             # Install Proxmox agent if requested
             vm_setup_features = props.get('vm_setup_features', [])
@@ -883,49 +949,46 @@ class VMProvider(pulumi.dynamic.ResourceProvider):
                 vm_setup_features = [vm_setup_features]
                 
             if 'proxmox_agent' in vm_setup_features:
-                # Install Proxmox agent
-                stdin, stdout, stderr = ssh.exec_command('sudo apt-get update && sudo apt-get install -y qemu-guest-agent')
-                stdout.channel.recv_exit_status()
-                
-                # Enable and start the agent
-                stdin, stdout, stderr = ssh.exec_command('sudo systemctl enable qemu-guest-agent && sudo systemctl start qemu-guest-agent')
-                stdout.channel.recv_exit_status()
+                logger.debug("Installing Proxmox guest agent")
+                run_command('sudo DEBIAN_FRONTEND=noninteractive apt-get update')
+                run_command('sudo DEBIAN_FRONTEND=noninteractive apt-get install -y qemu-guest-agent')
+                run_command('sudo systemctl enable qemu-guest-agent')
+                run_command('sudo systemctl start qemu-guest-agent')
             
             # Create admin user if requested
             if props.get('vm_user_create_admin_user', False) and props.get('vm_user_username'):
                 admin_user = props.get('vm_user_username')
+                logger.debug(f"Creating admin user: {admin_user}")
                 
-                # Create user
-                stdin, stdout, stderr = ssh.exec_command(f'sudo useradd -m -s /bin/bash {admin_user}')
-                stdout.channel.recv_exit_status()
-                
-                # Add to sudo group
-                stdin, stdout, stderr = ssh.exec_command(f'sudo usermod -aG sudo {admin_user}')
-                stdout.channel.recv_exit_status()
+                # Check if user already exists
+                exit_status, _, _ = run_command(f'id {admin_user}', check_exit=False)
+                if exit_status != 0:
+                    # Create user
+                    run_command(f'sudo useradd -m -s /bin/bash {admin_user}')
+                    
+                    # Add to sudo group
+                    run_command(f'sudo usermod -aG sudo {admin_user}')
+                    
+                    # Configure passwordless sudo
+                    sudoers_content = f'{admin_user} ALL=(ALL) NOPASSWD:ALL'
+                    run_command(f'echo "{sudoers_content}" | sudo tee /etc/sudoers.d/{admin_user}')
+                    run_command(f'sudo chmod 440 /etc/sudoers.d/{admin_user}')
                 
                 # Configure SSH key if provided
                 admin_ssh_key = props.get('vm_user_ssh_public_key')
                 if admin_ssh_key:
+                    logger.debug("Configuring SSH key for admin user")
                     # If the ssh_key is a file path, read it
                     if admin_ssh_key.startswith('/') and os.path.exists(admin_ssh_key):
                         with open(admin_ssh_key, 'r') as f:
                             admin_ssh_key = f.read().strip()
                     
                     # Create .ssh directory
-                    stdin, stdout, stderr = ssh.exec_command(f'sudo mkdir -p /home/{admin_user}/.ssh')
-                    stdout.channel.recv_exit_status()
-                    
-                    # Add the key
-                    stdin, stdout, stderr = ssh.exec_command(f'echo "{admin_ssh_key}" | sudo tee /home/{admin_user}/.ssh/authorized_keys')
-                    stdout.channel.recv_exit_status()
-                    
-                    # Set permissions
-                    stdin, stdout, stderr = ssh.exec_command(f'sudo chown -R {admin_user}:{admin_user} /home/{admin_user}/.ssh')
-                    stdout.channel.recv_exit_status()
-                    stdin, stdout, stderr = ssh.exec_command(f'sudo chmod 700 /home/{admin_user}/.ssh')
-                    stdout.channel.recv_exit_status()
-                    stdin, stdout, stderr = ssh.exec_command(f'sudo chmod 600 /home/{admin_user}/.ssh/authorized_keys')
-                    stdout.channel.recv_exit_status()
+                    run_command(f'sudo mkdir -p /home/{admin_user}/.ssh')
+                    run_command(f'echo "{admin_ssh_key}" | sudo tee /home/{admin_user}/.ssh/authorized_keys')
+                    run_command(f'sudo chown -R {admin_user}:{admin_user} /home/{admin_user}/.ssh')
+                    run_command(f'sudo chmod 700 /home/{admin_user}/.ssh')
+                    run_command(f'sudo chmod 600 /home/{admin_user}/.ssh/authorized_keys')
             
             # Execute custom setup commands if provided
             vm_setup_commands = props.get('vm_setup_commands', [])
@@ -933,8 +996,8 @@ class VMProvider(pulumi.dynamic.ResourceProvider):
                 vm_setup_commands = [vm_setup_commands]
                 
             for cmd in vm_setup_commands:
-                stdin, stdout, stderr = ssh.exec_command(cmd)
-                stdout.channel.recv_exit_status()
+                logger.debug(f"Running custom setup command: {cmd}")
+                run_command(cmd)
             
             # Execute custom setup scripts if provided
             vm_setup_scripts = props.get('vm_setup_scripts', [])
@@ -942,6 +1005,7 @@ class VMProvider(pulumi.dynamic.ResourceProvider):
                 vm_setup_scripts = [vm_setup_scripts]
                 
             for script in vm_setup_scripts:
+                logger.debug(f"Running setup script")
                 # If the script is a file path, read it
                 script_content = None
                 if script.startswith('/') and os.path.exists(script):
@@ -953,21 +1017,13 @@ class VMProvider(pulumi.dynamic.ResourceProvider):
                 
                 # Create a temporary file
                 temp_filename = f"/tmp/setup_{int(time.time())}.sh"
-                stdin, stdout, stderr = ssh.exec_command(f'echo "{script_content}" > {temp_filename}')
-                stdout.channel.recv_exit_status()
+                run_command(f'cat > {temp_filename} << "EOF"\n{script_content}\nEOF')
+                run_command(f'chmod +x {temp_filename}')
+                run_command(f'sudo {temp_filename}')
+                run_command(f'rm {temp_filename}')
                 
-                # Make it executable
-                stdin, stdout, stderr = ssh.exec_command(f'chmod +x {temp_filename}')
-                stdout.channel.recv_exit_status()
-                
-                # Execute it
-                stdin, stdout, stderr = ssh.exec_command(f'sudo {temp_filename}')
-                stdout.channel.recv_exit_status()
-                
-                # Clean up
-                stdin, stdout, stderr = ssh.exec_command(f'rm {temp_filename}')
-                stdout.channel.recv_exit_status()
         finally:
+            # Always close the SSH connection
             ssh.close()
     
     def _wait_for_ssh(self, ip_address: str, username: str, password: Optional[str], 
@@ -993,62 +1049,44 @@ class VMProvider(pulumi.dynamic.ResourceProvider):
                 if ssh_key_path:
                     try:
                         # If the ssh_key is a file path, read it
-                        key_data = None
                         if ssh_key_path.startswith('/') and os.path.exists(ssh_key_path):
-                            with open(ssh_key_path, 'rb') as f:
-                                key_data = f.read()
+                            logger.debug(f"Loading SSH key from file: {ssh_key_path}")
+                            key = paramiko.RSAKey.from_private_key_file(
+                                ssh_key_path,
+                                password=ssh_key_passphrase
+                            )
                         else:
                             # Assume it's the actual key data
-                            key_data = ssh_key_path.encode('utf-8')
+                            logger.debug("Loading SSH key from provided key data")
+                            key_file = io.StringIO(ssh_key_path)
+                            key = paramiko.RSAKey.from_private_key(
+                                key_file,
+                                password=ssh_key_passphrase
+                            )
                         
-                        try:
-                            # First try to load the key with passphrase if provided
-                            if ssh_key_passphrase:
-                                key = paramiko.RSAKey.from_private_key(
-                                    paramiko.PKey.from_private_key_data(key_data),
-                                    password=ssh_key_passphrase
-                                )
-                            else:
-                                # Try without passphrase
-                                key = paramiko.RSAKey.from_private_key(
-                                    paramiko.PKey.from_private_key_data(key_data)
-                                )
-                            
-                            logger.debug(f"Attempting SSH connection to {ip_address} with key authentication")
-                            ssh.connect(ip_address, username=username, pkey=key, timeout=10)
-                            
-                        except paramiko.ssh_exception.PasswordRequiredException:
-                            if not ssh_key_passphrase:
-                                raise Exception("SSH key requires a passphrase but none was provided")
-                            raise
-                            
-                    except Exception as e:
-                        logger.warning(f"Failed to connect with SSH key: {str(e)}")
+                        logger.debug(f"Attempting SSH connection to {ip_address} with key authentication")
+                        ssh.connect(ip_address, username=username, pkey=key, timeout=10)
+                        
+                    except (paramiko.ssh_exception.SSHException, 
+                           paramiko.ssh_exception.PasswordRequiredException) as e:
+                        logger.warning(f"Failed to load SSH key: {str(e)}")
                         if password:
-                            # Fallback to password if available
-                            logger.debug(f"Attempting SSH connection to {ip_address} with password authentication")
+                            logger.debug("Falling back to password authentication")
                             ssh.connect(ip_address, username=username, password=password, timeout=10)
                         else:
                             raise
-                            
-                elif password:
-                    # Connect with password if no SSH key provided
+                else:
+                    # Connect with password
                     logger.debug(f"Attempting SSH connection to {ip_address} with password authentication")
                     ssh.connect(ip_address, username=username, password=password, timeout=10)
-                else:
-                    raise Exception("Neither SSH key nor password provided for authentication")
                 
-                # If we get here, connection succeeded
-                logger.debug(f"Successfully connected to {ip_address} via SSH")
+                logger.debug("SSH connection successful")
                 ssh.close()
                 return
                 
-            except Exception as e:
-                # Connection failed, wait and try again
+            except (socket.error, paramiko.ssh_exception.SSHException) as e:
                 if time.time() - start_time > timeout:
-                    raise Exception(f"Timeout waiting for SSH on {ip_address}: {str(e)}")
-                
-                logger.debug(f"SSH connection attempt failed: {str(e)}, retrying...")
+                    raise Exception(f"Timed out waiting for SSH connection: {str(e)}")
                 time.sleep(5)
     
     def _wait_for_specific_task(self, client: ProxmoxClient, node: str, task_id: str, 

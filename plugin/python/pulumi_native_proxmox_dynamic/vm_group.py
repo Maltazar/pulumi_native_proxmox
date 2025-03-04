@@ -8,9 +8,12 @@ import re
 import ipaddress
 import pulumi
 from typing import Any, Dict, List, Optional, Union
+import logging
 
 from .vm import VM
 from .provider import ProxmoxProvider
+
+logger = logging.getLogger(__name__)
 
 
 class VMGroup(pulumi.ComponentResource):
@@ -78,15 +81,26 @@ class VMGroup(pulumi.ComponentResource):
             
             # Set IP address if available
             if i < len(ip_addresses):
-                # The IP configuration format depends on the cloud-init implementation
-                # This assumes a standard cloud-init setup with Debian/Ubuntu
-                if 'ip_config' not in vm_props:
-                    vm_props['ip_config'] = {}
-                    
-                vm_props['ip_config']['ipv4'] = {
-                    'address': ip_addresses[i],
-                    'gateway': gateway,
-                }
+                logger.info(f"Configuring static IP for VM {vm_name}")
+                # Format the IP configuration in Proxmox cloud-init format
+                # Default to /24 netmask if not specified in the IP
+                ip = ip_addresses[i]
+                if '/' not in ip:
+                    ip = f"{ip}/24"
+                logger.debug(f"Using IP address: {ip}")
+                
+                # Set ipconfig0 in Proxmox cloud-init format
+                ipconfig = f"ip={ip}"
+                if gateway:
+                    ipconfig += f",gw={gateway}"
+                logger.debug(f"Final ipconfig0 value: {ipconfig}")
+                
+                # Set using the correct property name expected by Proxmox
+                vm_props['ipconfig0'] = ipconfig
+            else:
+                logger.warning(f"No IP address available for VM {vm_name}")
+            
+            logger.debug(f"Final VM properties for {vm_name}: {vm_props}")
             
             # Create the VM
             vm = VM(
