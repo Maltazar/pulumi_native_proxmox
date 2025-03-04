@@ -609,8 +609,6 @@ class VMProvider(pulumi.dynamic.ResourceProvider):
         # Cloud-init configuration
         if props.get('cloud_init_user'):
             config['ciuser'] = props.get('cloud_init_user')
-        if props.get('cloud_init_password'):
-            config['cipassword'] = props.get('cloud_init_password')
         
         # Handle SSH key for cloud-init
         ssh_key = props.get('cloud_init_ssh_public_key')
@@ -624,6 +622,19 @@ class VMProvider(pulumi.dynamic.ResourceProvider):
             # Proxmox expects a properly formatted SSH key
             ssh_key = ssh_key.replace('\n', '')
             config['sshkeys'] = urllib.parse.quote(ssh_key)
+            
+            # Log the SSH key being set (without the actual key content)
+            logger.debug(f"Setting cloud-init SSH key for user {props.get('cloud_init_user')}")
+            
+        # DNS configuration if provided
+        if props.get('cloud_init_dns_domain'):
+            config['searchdomain'] = props.get('cloud_init_dns_domain')
+        if props.get('cloud_init_dns_servers'):
+            config['nameserver'] = props.get('cloud_init_dns_servers')
+            
+        # IP configuration if provided
+        if props.get('cloud_init_ip_config'):
+            config['ipconfig0'] = props.get('cloud_init_ip_config')
         
         # Enable Proxmox agent if requested in VM setup features
         vm_setup_features = props.get('vm_setup_features', [])
@@ -635,12 +646,79 @@ class VMProvider(pulumi.dynamic.ResourceProvider):
         
         # Apply configuration if any
         if config:
-            response = client.request(
-                'POST',
-                f'/nodes/{node}/qemu/{vmid}/config',
-                data=config
-            )
-            # No need to wait for completion as config changes are usually immediate
+            logger.debug(f"Applying VM configuration for {vmid}: {config}")
+            try:
+                # First get current config to compare
+                current = client.request('GET', f'/nodes/{node}/qemu/{vmid}/config')
+                logger.debug(f"Current VM config before changes: {current}")
+                
+                # Apply changes in smaller batches to isolate issues
+                for key, value in config.items():
+                    try:
+                        logger.debug(f"Applying config {key}={value} to VM {vmid}")
+                        batch_config = {key: value}
+                        response = client.request(
+                            'POST',
+                            f'/nodes/{node}/qemu/{vmid}/config',
+                            data=batch_config
+                        )
+                        logger.debug(f"Config update response for {key}: {response}")
+                        
+                        # Some config changes might return a task ID
+                        task_id = None
+                        if isinstance(response, dict):
+                            if 'data' in response:
+                                task_id = response['data']
+                                logger.debug(f"Found task ID in response['data']: {task_id}")
+                            else:
+                                for k, v in response.items():
+                                    if k in ['upid', 'task_id']:
+                                        task_id = v
+                                        logger.debug(f"Found task ID in key '{k}': {task_id}")
+                        elif isinstance(response, str):
+                            task_id = response
+                            logger.debug(f"Response is string, using as task ID: {task_id}")
+
+                        if task_id:
+                            logger.debug(f"Waiting for config update task: {task_id}")
+                            self._wait_for_specific_task(client, node, task_id)
+                            # Add a small delay between configuration changes
+                            time.sleep(1)
+                            
+                        # Verify this specific change
+                        verify_response = client.request('GET', f'/nodes/{node}/qemu/{vmid}/config')
+                        if 'data' in verify_response:
+                            current_value = verify_response['data'].get(key)
+                            logger.debug(f"Verifying {key}: expected={value}, current={current_value}")
+                            if str(current_value) != str(value):
+                                logger.warning(f"Configuration mismatch for {key}: expected {value}, got {current_value}")
+                                
+                    except Exception as e:
+                        error_msg = str(e)
+                        logger.error(f"Failed to apply configuration {key}={value}: {error_msg}")
+                        if "permission denied" in error_msg.lower():
+                            raise Exception(f"Permission denied while configuring VM {vmid}. Check your API token permissions.")
+                        elif "invalid parameter" in error_msg.lower():
+                            raise Exception(f"Invalid configuration parameter '{key}' for VM {vmid}: {error_msg}")
+                        else:
+                            raise Exception(f"Failed to configure VM {vmid} parameter '{key}': {error_msg}")
+                            
+                # Final verification of all changes
+                try:
+                    final_config = client.request('GET', f'/nodes/{node}/qemu/{vmid}/config')
+                    logger.debug(f"Final VM configuration: {final_config}")
+                except Exception as e:
+                    logger.warning(f"Failed to get final configuration: {e}")
+                    
+            except Exception as e:
+                error_msg = str(e)
+                logger.error(f"Failed to apply configuration: {error_msg}")
+                if "permission denied" in error_msg.lower():
+                    raise Exception(f"Permission denied while configuring VM {vmid}. Check your API token permissions.")
+                elif "invalid parameter" in error_msg.lower():
+                    raise Exception(f"Invalid configuration parameter for VM {vmid}: {error_msg}")
+                else:
+                    raise Exception(f"Failed to configure VM {vmid}: {error_msg}")
     
     def _start_vm(self, client: ProxmoxClient, node: str, vmid: int) -> None:
         """Start a VM.
@@ -900,9 +978,9 @@ class VMProvider(pulumi.dynamic.ResourceProvider):
         Args:
             ip_address: VM IP address
             username: SSH username
-            password: SSH password
-            ssh_key_path: Path to SSH private key
-            ssh_key_passphrase: Passphrase for SSH private key
+            password: SSH password (only used if ssh_key_path is not provided)
+            ssh_key_path: Path to or content of SSH private key
+            ssh_key_passphrase: Passphrase to decrypt the SSH private key (if needed)
             timeout: Timeout in seconds
         """
         start_time = time.time()
@@ -913,32 +991,64 @@ class VMProvider(pulumi.dynamic.ResourceProvider):
             try:
                 # Try to connect with SSH key if provided
                 if ssh_key_path:
-                    # If the ssh_key is a file path, read it
-                    key_data = None
-                    if ssh_key_path.startswith('/') and os.path.exists(ssh_key_path):
-                        with open(ssh_key_path, 'rb') as f:
-                            key_data = f.read()
-                    else:
-                        # Assume it's the actual key data
-                        key_data = ssh_key_path.encode('utf-8')
-                    
-                    key = paramiko.RSAKey.from_private_key(
-                        paramiko.PKey.from_private_key_data(key_data, 
-                                                          password=ssh_key_passphrase)
-                    )
-                    ssh.connect(ip_address, username=username, pkey=key, timeout=10)
-                else:
-                    # Connect with password
+                    try:
+                        # If the ssh_key is a file path, read it
+                        key_data = None
+                        if ssh_key_path.startswith('/') and os.path.exists(ssh_key_path):
+                            with open(ssh_key_path, 'rb') as f:
+                                key_data = f.read()
+                        else:
+                            # Assume it's the actual key data
+                            key_data = ssh_key_path.encode('utf-8')
+                        
+                        try:
+                            # First try to load the key with passphrase if provided
+                            if ssh_key_passphrase:
+                                key = paramiko.RSAKey.from_private_key(
+                                    paramiko.PKey.from_private_key_data(key_data),
+                                    password=ssh_key_passphrase
+                                )
+                            else:
+                                # Try without passphrase
+                                key = paramiko.RSAKey.from_private_key(
+                                    paramiko.PKey.from_private_key_data(key_data)
+                                )
+                            
+                            logger.debug(f"Attempting SSH connection to {ip_address} with key authentication")
+                            ssh.connect(ip_address, username=username, pkey=key, timeout=10)
+                            
+                        except paramiko.ssh_exception.PasswordRequiredException:
+                            if not ssh_key_passphrase:
+                                raise Exception("SSH key requires a passphrase but none was provided")
+                            raise
+                            
+                    except Exception as e:
+                        logger.warning(f"Failed to connect with SSH key: {str(e)}")
+                        if password:
+                            # Fallback to password if available
+                            logger.debug(f"Attempting SSH connection to {ip_address} with password authentication")
+                            ssh.connect(ip_address, username=username, password=password, timeout=10)
+                        else:
+                            raise
+                            
+                elif password:
+                    # Connect with password if no SSH key provided
+                    logger.debug(f"Attempting SSH connection to {ip_address} with password authentication")
                     ssh.connect(ip_address, username=username, password=password, timeout=10)
+                else:
+                    raise Exception("Neither SSH key nor password provided for authentication")
                 
                 # If we get here, connection succeeded
+                logger.debug(f"Successfully connected to {ip_address} via SSH")
                 ssh.close()
                 return
-            except Exception:
+                
+            except Exception as e:
                 # Connection failed, wait and try again
                 if time.time() - start_time > timeout:
-                    raise Exception(f"Timeout waiting for SSH on {ip_address}")
+                    raise Exception(f"Timeout waiting for SSH on {ip_address}: {str(e)}")
                 
+                logger.debug(f"SSH connection attempt failed: {str(e)}, retrying...")
                 time.sleep(5)
     
     def _wait_for_specific_task(self, client: ProxmoxClient, node: str, task_id: str, 
@@ -978,14 +1088,17 @@ class VMProvider(pulumi.dynamic.ResourceProvider):
                 if task_status == 'stopped':
                     if task_exitstatus == 'OK':
                         logger.debug(f"Task {task_id} completed successfully")
+                        # Add a small delay after task completion to ensure Proxmox has fully processed it
+                        time.sleep(2)
                         return
                     else:
                         error = task_msg or 'Unknown error'
                         raise Exception(f"Task {task_id} failed: {error} (exit status: {task_exitstatus})")
                 
             except Exception as e:
+                error_msg = str(e)
                 # Handle task not found case
-                if "not found" in str(e).lower():
+                if "not found" in error_msg.lower():
                     logger.debug(f"Task {task_id} not found, checking task history")
                     try:
                         # Get recent tasks
@@ -1005,6 +1118,8 @@ class VMProvider(pulumi.dynamic.ResourceProvider):
                                 
                                 if status == 'stopped' and exitstatus == 'OK':
                                     logger.debug(f"Task {task_id} completed successfully (verified from task history)")
+                                    # Add a small delay after task completion to ensure Proxmox has fully processed it
+                                    time.sleep(2)
                                     return
                                 elif status == 'stopped':
                                     raise Exception(f"Task {task_id} failed: {msg or 'Unknown error'}")
@@ -1013,14 +1128,14 @@ class VMProvider(pulumi.dynamic.ResourceProvider):
                     except Exception as inner_e:
                         logger.debug(f"Error checking task history: {inner_e}")
                 else:
-                    logger.debug(f"Error checking task status: {e}")
+                    logger.debug(f"Error checking task status: {error_msg}")
             
             # Check timeout
             if time.time() - start_time > timeout:
                 raise Exception(f"Timeout waiting for task {task_id} to complete on node {node}")
             
-            # Wait before checking again
-            time.sleep(2)
+            # Wait before checking again - increased interval to avoid overwhelming the API
+            time.sleep(3)
 
     def _wait_for_task_completion(self, client: ProxmoxClient, node: str, 
                                  timeout: int = 300) -> None:
